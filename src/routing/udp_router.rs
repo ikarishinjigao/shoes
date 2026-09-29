@@ -600,11 +600,6 @@ impl<'a> UdpRouter<'a> {
                         continue;
                     }
 
-                    // Skip if session has too many pending writes (backpressure)
-                    if session.in_remote_write_queue >= MAX_PENDING_REMOTE_WRITES_PER_SESSION {
-                        continue;
-                    }
-
                     // Always try to write immediately
                     match Pin::new(&mut session.remote).poll_write_message(cx, &buf[..len]) {
                         Poll::Ready(Ok(())) => {
@@ -625,6 +620,15 @@ impl<'a> UdpRouter<'a> {
                             session.in_remote_write_queue += 1;
                             self.remote_write_queue
                                 .push_back(PendingWrite { id: *id, buf, len });
+
+                            // Keep the packet we already read, then stop pulling more data
+                            // until the bounded per-session queue has drained.
+                            if session.in_remote_write_queue
+                                >= MAX_PENDING_REMOTE_WRITES_PER_SESSION
+                            {
+                                return (server_read_progress, remote_writes_progress);
+                            }
+
                             let Some(new_buf) = self.remote_write_pool.acquire() else {
                                 return (server_read_progress, remote_writes_progress);
                             };
@@ -658,6 +662,12 @@ impl<'a> UdpRouter<'a> {
                     }
 
                     self.start_session_creation(cx, packet, &buf[..len]);
+                    if !self.pending_creates.is_empty() {
+                        // Session setup owns the packet we just read. Stop here and let
+                        // TCP apply backpressure until setup completes, preserving later
+                        // datagrams instead of dropping them as `Pending` packets.
+                        break;
+                    }
                 }
             }
         }
@@ -1286,7 +1296,7 @@ impl UdpRouter<'_> {
             }
 
             // Read from server and route to remotes (if not EOF)
-            if !self.server_read_eof {
+            if !self.server_read_eof && self.pending_creates.is_empty() {
                 let (new_server_read_progress, new_remote_writes_progress) =
                     self.poll_read_server(cx);
                 server_read_progress |= new_server_read_progress;

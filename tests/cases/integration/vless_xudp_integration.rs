@@ -568,7 +568,6 @@ async fn test_vless_xudp_concurrent_connections() -> Result<(), Box<dyn std::err
 
 /// Test rapid burst of UDP packets
 #[tokio::test]
-#[ignore = "known XUDP burst-loss behavior under sustained packet bursts"]
 async fn test_vless_xudp_rapid_burst() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_vless_ip, shoes_vless_port) = port_helper.get_listener_port();
@@ -1397,7 +1396,6 @@ async fn test_reality_vision_xudp_large_payloads() -> Result<(), Box<dyn std::er
 
 /// Test REALITY + Vision + XUDP rapid burst
 #[tokio::test]
-#[ignore = "known XUDP burst-loss behavior under sustained packet bursts"]
 async fn test_reality_vision_xudp_rapid_burst() -> Result<(), Box<dyn std::error::Error>> {
     let mut port_helper = common::port_helper::PortHelper::new();
     let (shoes_reality_ip, shoes_reality_port) = port_helper.get_listener_port();
