@@ -33,7 +33,12 @@ pub struct UnpadResult {
 #[derive(Debug, Clone)]
 enum UnpadState {
     /// Initial state: expecting UUID (16 bytes) before first command
-    Initial { expected_uuid: [u8; 16] },
+    Initial {
+        expected_uuid: [u8; 16],
+        received_uuid: Vec<u8>,
+    },
+    /// The peer did not send Vision padding, so pass all subsequent bytes through unchanged.
+    Passthrough,
     /// Reading the command byte (first of 5 header bytes)
     ReadingCommand,
     /// Reading content length (2 bytes)
@@ -75,7 +80,10 @@ pub struct VisionUnpadder {
 impl VisionUnpadder {
     pub fn new(expected_uuid: [u8; 16]) -> Self {
         Self {
-            state: UnpadState::Initial { expected_uuid },
+            state: UnpadState::Initial {
+                expected_uuid,
+                received_uuid: Vec::with_capacity(16),
+            },
             first_block: true,
             accumulated_buffer: Vec::new(),
         }
@@ -96,23 +104,41 @@ impl VisionUnpadder {
 
         loop {
             match &mut self.state {
-                UnpadState::Initial { expected_uuid } => {
-                    if data.len() < 16 {
+                UnpadState::Initial {
+                    expected_uuid,
+                    received_uuid,
+                } => {
+                    let needed = 16 - received_uuid.len();
+                    let to_copy = needed.min(data.len());
+                    received_uuid.extend_from_slice(&data[..to_copy]);
+                    data = &data[to_copy..];
+
+                    if received_uuid.len() < 16 {
                         return Ok(UnpadResult::default()); // Need more data
                     }
 
                     // Check if this is XTLS padding data
-                    if &data[..16] != expected_uuid {
-                        // Not XTLS padding data
+                    if received_uuid.as_slice() != expected_uuid {
+                        // Not XTLS padding data. Return the buffered prefix as well as this
+                        // call's remaining bytes, then preserve passthrough behavior for every
+                        // subsequent call.
+                        let mut content = std::mem::take(received_uuid);
+                        content.extend_from_slice(data);
+                        self.state = UnpadState::Passthrough;
                         return Ok(UnpadResult {
-                            content: data.to_vec(),
+                            content,
                             command: None,
                         });
                     }
 
-                    // Consume UUID
-                    data = &data[16..];
                     self.state = UnpadState::ReadingCommand;
+                }
+
+                UnpadState::Passthrough => {
+                    return Ok(UnpadResult {
+                        content: data.to_vec(),
+                        command: None,
+                    });
                 }
 
                 UnpadState::ReadingCommand => {
@@ -430,13 +456,52 @@ mod tests {
         assert!(result.content.is_empty()); // Need more data
         assert!(result.command.is_none());
 
-        // Data that's exactly 16 bytes but doesn't match UUID
-        let non_xtls_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        let result = state.unpad(&non_xtls_data[..]).unwrap();
-        assert_eq!(result.content, non_xtls_data);
+        // The second read completes a prefix that does not match the UUID. The bytes from
+        // both reads must be returned in order.
+        let non_xtls_data = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let result = state.unpad(&non_xtls_data).unwrap();
+        assert_eq!(
+            result.content,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
         assert_eq!(result.command, None);
-        // State remains Initial (doesn't transition to Done for non-XTLS data)
-        assert!(!matches!(state.state, UnpadState::Done));
+        assert!(matches!(state.state, UnpadState::Passthrough));
+
+        // Passthrough data must not be buffered or dropped, even when shorter than a UUID.
+        let trailing_data = [17, 18, 19];
+        let result = state.unpad(&trailing_data).unwrap();
+        assert_eq!(result.content, trailing_data);
+        assert_eq!(result.command, None);
+    }
+
+    #[test]
+    fn test_uuid_split_at_every_read_boundary() {
+        let user_uuid = [7u8; 16];
+
+        let mut data = vec![7u8; 16];
+        data.extend_from_slice(&[
+            1, // command (End)
+            0, 3, // content length = 3
+            0, 0, // padding length = 0
+            10, 11, 12, // content
+        ]);
+
+        for split_at in 1..16 {
+            let mut state = VisionUnpadder::new(user_uuid);
+
+            let result1 = state.unpad(&data[..split_at]).unwrap();
+            assert!(result1.content.is_empty(), "split at {split_at}");
+            assert_eq!(result1.command, None, "split at {split_at}");
+
+            let result2 = state.unpad(&data[split_at..]).unwrap();
+            assert_eq!(result2.content, vec![10, 11, 12], "split at {split_at}");
+            assert_eq!(
+                result2.command,
+                Some(UnpadCommand::End),
+                "split at {split_at}"
+            );
+            assert!(matches!(state.state, UnpadState::Done));
+        }
     }
 
     #[test]
