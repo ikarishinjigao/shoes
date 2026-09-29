@@ -6,6 +6,7 @@ pub mod vless_server_handler;
 
 // Internal implementation details
 pub(crate) mod encryption;
+mod packet_addr_stream;
 mod tls_fuzzy_deframer;
 mod tls_handshake_util;
 mod vision_filter;
