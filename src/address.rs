@@ -225,7 +225,10 @@ impl NetLocation {
 
 impl std::fmt::Display for NetLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}:{}", self.address, self.port)
+        match self.address {
+            Address::Ipv6(ref address) => write!(f, "[{address}]:{}", self.port),
+            _ => write!(f, "{}:{}", self.address, self.port),
+        }
     }
 }
 
@@ -501,7 +504,10 @@ impl NetLocationPortRange {
 
 impl std::fmt::Display for NetLocationPortRange {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}:", self.address)?;
+        match self.address {
+            Address::Ipv6(ref address) => write!(f, "[{address}]:")?,
+            _ => write!(f, "{}:", self.address)?,
+        }
 
         // It shouldn't be possible to create an instance with empty ports.
         assert!(!self.ports.is_empty());
@@ -744,6 +750,8 @@ impl std::fmt::Display for NetLocationMask {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         if self.port == 0 {
             write!(f, "{}", self.address_mask)
+        } else if self.address_mask.address.is_ipv6() {
+            write!(f, "[{}]:{}", self.address_mask, self.port)
         } else {
             write!(f, "{}:{}", self.address_mask, self.port)
         }
@@ -868,6 +876,35 @@ mod tests {
     }
 
     #[test]
+    fn test_bracketed_ipv6_location_round_trips() {
+        let location = NetLocation::from_str("[2001:db8::1]:443", None).unwrap();
+        assert_eq!(
+            location,
+            NetLocation::new(Address::Ipv6("2001:db8::1".parse().unwrap()), 443)
+        );
+        assert_eq!(location.to_string(), "[2001:db8::1]:443");
+
+        let yaml = serde_yaml::to_string(&location).unwrap();
+        let deserialized: NetLocation = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized, location);
+    }
+
+    #[test]
+    fn test_bracketed_ipv6_port_range_round_trips() {
+        let range = NetLocationPortRange::from_str("[2001:db8::1]:443-445").unwrap();
+        assert_eq!(range.to_string(), "[2001:db8::1]:443-445");
+    }
+
+    #[test]
+    fn test_fake_ip_literal_bypasses_dns() {
+        let location = NetLocation::from_str("198.18.0.1:443", None).unwrap();
+        assert_eq!(
+            location.to_socket_addr_nonblocking(),
+            Some("198.18.0.1:443".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn test_http_authority_parsing() {
         assert_eq!(
             NetLocation::from_authority("example.com:8080", None).unwrap(),
@@ -933,5 +970,15 @@ mod tests {
             serde_yaml::from_str(&yaml_str).expect("Failed to deserialize NetLocationMask");
 
         assert_eq!(net_location_mask.to_string(), deserialized.to_string());
+    }
+
+    #[test]
+    fn test_ipv6_netlocationmask_round_trips() {
+        let mask = NetLocationMask::from("[2001:db8::/32]:443").unwrap();
+        assert_eq!(mask.to_string(), "[2001:db8::/32]:443");
+
+        let yaml = serde_yaml::to_string(&mask).unwrap();
+        let deserialized: NetLocationMask = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.to_string(), mask.to_string());
     }
 }
