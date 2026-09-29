@@ -61,7 +61,6 @@ struct WireSession {
 
 struct RoutedSession {
     wire_session_id: u16,
-    original_destination: NetLocation,
 }
 
 impl XudpMessageStream {
@@ -161,7 +160,6 @@ impl XudpMessageStream {
             route_id,
             RoutedSession {
                 wire_session_id,
-                original_destination: original_destination.clone(),
             },
         );
         Ok(Some(route_id))
@@ -328,6 +326,12 @@ impl AsyncFlushMessage for XudpMessageStream {
 
         while !this.write_buffer.is_empty() {
             let n = ready!(Pin::new(&mut this.inner_stream).poll_write(cx, &this.write_buffer))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write XUDP frame",
+                )));
+            }
             this.write_buffer.advance(n);
         }
 
@@ -527,8 +531,6 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
         target: &SocketAddr,
     ) -> Poll<std::io::Result<()>> {
         // This is the reverse direction: UDP response from internet → XUDP client
-        // Use original destination (may be hostname) in response frame, NOT resolved IP
-
         log::debug!(
             "[XUDP SESSION WRITE] Writing {} bytes for session {} from source {}",
             buf.len(),
@@ -549,20 +551,33 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             return Poll::Ready(Ok(()));
         };
         let wire_session_id = route.wire_session_id;
-        let target_location = route.original_destination.clone();
+        let source_location = match target {
+            SocketAddr::V4(address) => {
+                NetLocation::new(Address::Ipv4(*address.ip()), address.port())
+            }
+            SocketAddr::V6(address) => {
+                NetLocation::new(Address::Ipv6(*address.ip()), address.port())
+            }
+        };
 
         log::debug!(
-            "[XUDP SESSION WRITE] Using original destination {} for session {} (response came from {})",
-            target_location,
+            "[XUDP SESSION WRITE] Encoding source {} for wire session {}",
+            source_location,
             wire_session_id,
-            target
         );
+
+        if buf.len() > u16::MAX as usize {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XUDP payload is too large",
+            )));
+        }
 
         let metadata = FrameMetadata {
             session_id: wire_session_id,
             status: SessionStatus::Keep,
             option: FrameOption::new().with_data(),
-            target: Some(target_location.clone()),
+            target: Some(source_location.clone()),
             network: Some(TargetNetwork::Udp),
         };
 
@@ -570,7 +585,7 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             "[XUDP SESSION WRITE] Encoding {:?} frame: session_id={}, target={}, data_len={}",
             SessionStatus::Keep,
             wire_session_id,
-            target_location,
+            source_location,
             buf.len()
         );
 
