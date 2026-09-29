@@ -18,6 +18,7 @@ use crate::util::write_all;
 use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
+use super::packet_addr_stream::{VlessPacketAddrStream, is_packet_addr_location};
 use super::vision_stream::VisionStream;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_util::{
@@ -253,12 +254,20 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     vless_stream.feed_initial_read_data(unparsed_data)?;
                 }
 
-                Ok(TcpServerSetupResult::BidirectionalUdp {
-                    remote_location,
-                    stream: Box::new(vless_stream),
-                    need_initial_flush: false,
-                    proxy_selector: self.proxy_selector.clone(),
-                })
+                if is_packet_addr_location(&remote_location) {
+                    Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                        stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
+                        need_initial_flush: false,
+                        proxy_selector: self.proxy_selector.clone(),
+                    })
+                } else {
+                    Ok(TcpServerSetupResult::BidirectionalUdp {
+                        remote_location,
+                        stream: Box::new(vless_stream),
+                        need_initial_flush: false,
+                        proxy_selector: self.proxy_selector.clone(),
+                    })
+                }
             }
             COMMAND_MUX => {
                 if !self.udp_enabled {
@@ -401,12 +410,20 @@ where
                 vless_stream.feed_initial_read_data(unparsed_data)?;
             }
 
-            Ok(TcpServerSetupResult::BidirectionalUdp {
-                remote_location,
-                stream: Box::new(vless_stream),
-                need_initial_flush: false,
-                proxy_selector: proxy_selector.clone(),
-            })
+            if is_packet_addr_location(&remote_location) {
+                Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                    stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
+                    need_initial_flush: false,
+                    proxy_selector: proxy_selector.clone(),
+                })
+            } else {
+                Ok(TcpServerSetupResult::BidirectionalUdp {
+                    remote_location,
+                    stream: Box::new(vless_stream),
+                    need_initial_flush: false,
+                    proxy_selector: proxy_selector.clone(),
+                })
+            }
         }
         COMMAND_MUX => {
             if !udp_enabled {
