@@ -81,7 +81,7 @@ hyper = { version = "*", features = ["server", "http1", "http2"] }
 hyper-util = { version = "*", features = ["tokio", "server"] }
 indexmap = "*"
 libc = "*"
-log = { version = "*", features = ["std", "release_max_level_info"] }
+log = { version = "*", features = ["std"] }
 lru = "*"
 md-5 = "*"
 memchr = "*"
