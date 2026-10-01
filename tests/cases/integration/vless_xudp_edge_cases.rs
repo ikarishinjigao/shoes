@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use shoes_test_support as common;
 use tempfile::NamedTempFile;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
@@ -114,6 +115,43 @@ async fn expect_no_frame(client: &mut XudpClient<TcpStream>) -> TestResult {
         .await
         .expect_err("received an unexpected XUDP frame");
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_connection_half_close_releases_server_stream() -> TestResult {
+    let (client, _shoes, _config) = start_xudp_client().await?;
+    let mut stream = client.into_inner();
+    stream.shutdown().await?;
+    let mut buffer = [0; 32];
+    // The server may still owe the lazy VLESS response header, then must send EOF.
+    timeout(Duration::from_secs(3), async {
+        while stream.read(&mut buffer).await? != 0 {}
+        Ok::<_, std::io::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ended_session_half_close_releases_server_stream() -> TestResult {
+    let echo = start_echo(b" [ECHO]").await?;
+    let destination = echo.local_addr();
+    let (mut client, _shoes, _config) = start_xudp_client().await?;
+    client
+        .send_frame(&new_frame(1, destination, b"request"))
+        .await?;
+    expect_data(&mut client, 1, destination, b"request [ECHO]").await?;
+    client
+        .send_frame(&control_frame(1, XUDP_STATUS_END, 0, None))
+        .await?;
+    let mut stream = client.into_inner();
+    stream.shutdown().await?;
+    let mut buffer = [0; 1];
+    assert_eq!(
+        timeout(Duration::from_secs(3), stream.read(&mut buffer)).await??,
+        0
+    );
     Ok(())
 }
 
