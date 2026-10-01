@@ -494,7 +494,7 @@ impl<'a> UdpRouter<'a> {
         // Return buffers to pool and clear queue.
         // We don't update session.in_server_write_queue counters here because:
         // 1. We're in shutdown mode - no more server writes will happen
-        // 2. Sessions will be cleaned up through expiry anyway
+        // 2. The router terminates on write EOF, dropping its sessions
         // 3. Avoids borrow conflicts when called from contexts that hold session refs
         for pending in self.server_write_queue.drain(..) {
             self.server_write_pool.release(pending.buf);
@@ -1264,7 +1264,18 @@ impl<'a> Future for UdpRouter<'a> {
 
         this.drain_remote_shutdowns(cx);
 
-        if this.server_read_eof && this.server_write_eof {
+        // Write failure is terminal: no reply can reach the client anymore.
+        // Read EOF alone is a half-close, so preserve outstanding UDP replies
+        // until the last session closes/expires and accepted output is flushed.
+        // Do not wait for a write error on an idle stream: nothing would ever
+        // attempt that write, retaining the task, buffers and TCP socket forever.
+        if this.server_write_eof
+            || (this.server_read_eof
+                && this.sessions.is_empty()
+                && this.pending_creates.is_empty()
+                && this.server_write_queue.is_empty()
+                && !this.needs_server_flush)
+        {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
@@ -1391,7 +1402,7 @@ mod tests {
     use futures::task::noop_waker;
     use std::future::Future;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncRead, AsyncWrite};
 
     use crate::async_stream::AsyncStream;
@@ -1400,9 +1411,14 @@ mod tests {
     use crate::xudp::frame::{FrameMetadata, FrameOption, SessionStatus, TargetNetwork};
     use crate::xudp::message_stream::MAX_XUDP_ROUTES;
 
+    #[derive(Default)]
     struct PendingByteStream {
         input: Vec<u8>,
         offset: usize,
+        eof: bool,
+        write_error: bool,
+        flush_pending: Arc<AtomicBool>,
+        output: Arc<Mutex<Vec<u8>>>,
     }
 
     impl AsyncRead for PendingByteStream {
@@ -1412,7 +1428,11 @@ mod tests {
             buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
             if self.offset == self.input.len() {
-                return Poll::Pending;
+                return if self.eof {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                };
             }
 
             let end = (self.offset + buf.remaining()).min(self.input.len());
@@ -1428,11 +1448,22 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            if self.write_error {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "injected write failure",
+                )));
+            }
+            self.output.lock().unwrap().extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            if self.flush_pending.load(Ordering::SeqCst) {
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1473,6 +1504,7 @@ mod tests {
     #[derive(Default)]
     struct RemoteState {
         writes: Mutex<Vec<Vec<u8>>>,
+        responses: Mutex<VecDeque<Vec<u8>>>,
         shutdown_polls: AtomicUsize,
         drops: AtomicUsize,
     }
@@ -1491,9 +1523,14 @@ mod tests {
         fn poll_read_message(
             self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
+            buf: &mut ReadBuf<'_>,
         ) -> Poll<io::Result<()>> {
-            Poll::Pending
+            if let Some(response) = self.state.responses.lock().unwrap().pop_front() {
+                buf.put_slice(&response);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
         }
     }
 
@@ -1562,6 +1599,166 @@ mod tests {
         }
     }
 
+    fn insert_test_session(router: &mut UdpRouter<'_>, state: &Arc<RemoteState>) {
+        let destination = NetLocation::new(Address::Ipv4("127.0.0.1".parse().unwrap()), 12345);
+        let mut session = RoutingSession::new(
+            destination.clone(),
+            1,
+            destination.to_socket_addr_nonblocking().unwrap(),
+            LookupKey::SessionId(1),
+            Box::new(RecordingRemote {
+                state: Arc::clone(state),
+            }),
+        );
+        session.expiry_key = Some(
+            router
+                .expiry_queue
+                .insert(0, Duration::from_secs(SESSION_TIMEOUT_SECS)),
+        );
+        router.sessions.insert(0, session);
+        let SessionLookup::BySessionId(lookup) = &mut router.session_lookup else {
+            unreachable!()
+        };
+        lookup.insert(1, KeyState::Active(0));
+    }
+
+    fn test_session_input() -> Vec<u8> {
+        let mut input = BytesMut::new();
+        append_xudp_frame(
+            &mut input,
+            10,
+            SessionStatus::New,
+            Some(NetLocation::new(
+                Address::Ipv4("127.0.0.1".parse().unwrap()),
+                12345,
+            )),
+            Some(b"request"),
+        );
+        input.to_vec()
+    }
+
+    #[tokio::test]
+    async fn xudp_eof_without_sessions_completes() {
+        let inner = PendingByteStream {
+            eof: true,
+            ..Default::default()
+        };
+        let mut server = ServerStream::Session(Box::new(XudpMessageStream::new(Box::new(inner))));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_ready());
+        assert!(router.server_read_eof);
+        assert!(!router.server_write_eof);
+    }
+
+    #[tokio::test]
+    async fn xudp_eof_preserves_responses_and_completes_after_expiry() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let inner = PendingByteStream {
+            eof: true,
+            output: Arc::clone(&output),
+            input: test_session_input(),
+            ..Default::default()
+        };
+        let mut server = ServerStream::Session(Box::new(XudpMessageStream::new(Box::new(inner))));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let state = Arc::new(RemoteState::default());
+        insert_test_session(&mut router, &state);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        assert!(router.server_read_eof);
+
+        state
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(b"late UDP reply".to_vec());
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        assert!(
+            output
+                .lock()
+                .unwrap()
+                .windows(14)
+                .any(|bytes| bytes == b"late UDP reply")
+        );
+
+        let key = router
+            .sessions
+            .get(&0)
+            .unwrap()
+            .expiry_key
+            .as_ref()
+            .unwrap();
+        router.expiry_queue.reset(key, Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(Pin::new(&mut router).poll(&mut cx).is_ready());
+        assert!(router.sessions.is_empty());
+        // A remote whose graceful shutdown never completes must not retain the router.
+        assert!(state.shutdown_polls.load(Ordering::SeqCst) > 0);
+        drop(router);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn xudp_eof_waits_for_pending_flush() {
+        let flush_pending = Arc::new(AtomicBool::new(true));
+        let inner = PendingByteStream {
+            eof: true,
+            flush_pending: Arc::clone(&flush_pending),
+            ..Default::default()
+        };
+        let mut server = ServerStream::Session(Box::new(XudpMessageStream::new(Box::new(inner))));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            true,
+        );
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_pending());
+        flush_pending.store(false, Ordering::SeqCst);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_ready());
+    }
+
+    #[tokio::test]
+    async fn xudp_write_error_completes_while_client_read_is_pending() {
+        let inner = PendingByteStream {
+            write_error: true,
+            input: test_session_input(),
+            ..Default::default()
+        };
+        let mut server = ServerStream::Session(Box::new(XudpMessageStream::new(Box::new(inner))));
+        let mut router = UdpRouter::new(
+            &mut server,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            false,
+        );
+        let state = Arc::new(RemoteState::default());
+        state.responses.lock().unwrap().push_back(b"reply".to_vec());
+        insert_test_session(&mut router, &state);
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut router).poll(&mut cx).is_ready());
+        assert!(!router.server_read_eof);
+        assert!(router.server_write_eof);
+        drop(router);
+        assert_eq!(state.drops.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn route_overflow_preserves_existing_route_and_end_cancels_remote() {
         let address = Address::Ipv4("127.0.0.1".parse().unwrap());
@@ -1608,6 +1805,7 @@ mod tests {
         let inner = PendingByteStream {
             input: input.to_vec(),
             offset: 0,
+            ..Default::default()
         };
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         let xudp = XudpMessageStream::new_with_resolver(

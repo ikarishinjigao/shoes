@@ -156,12 +156,8 @@ impl XudpMessageStream {
             .expect("wire session disappeared during route allocation")
             .routes
             .insert(original_destination.clone(), route_id);
-        self.routes.insert(
-            route_id,
-            RoutedSession {
-                wire_session_id,
-            },
-        );
+        self.routes
+            .insert(route_id, RoutedSession { wire_session_id });
         Ok(Some(route_id))
     }
 
