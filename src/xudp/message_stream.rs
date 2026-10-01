@@ -282,6 +282,12 @@ impl AsyncFlushMessage for XudpMessageStream {
 
         while !this.write_buffer.is_empty() {
             let n = ready!(Pin::new(&mut this.inner_stream).poll_write(cx, &this.write_buffer))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write XUDP frame",
+                )));
+            }
             this.write_buffer.advance(n);
         }
 
@@ -480,6 +486,13 @@ impl AsyncWriteSessionMessage for XudpMessageStream {
             wire_session_id,
             target
         );
+
+        if buf.len() > u16::MAX as usize {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XUDP payload is too large",
+            )));
+        }
 
         let metadata = FrameMetadata {
             session_id: wire_session_id,
