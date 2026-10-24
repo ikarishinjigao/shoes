@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, ToSocketAddrs};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub enum Address {
@@ -12,23 +12,24 @@ impl Address {
     pub const UNSPECIFIED: Self = Address::Ipv4(Ipv4Addr::UNSPECIFIED);
 
     pub fn from(s: &str) -> std::io::Result<Self> {
-        let (s, bracketed) = if let Some(inner) = s.strip_prefix('[') {
-            let inner = inner.strip_suffix(']').ok_or_else(|| {
+        if let Some(bracketed) = s.strip_prefix('[') {
+            let invalid = || {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Failed to parse address: {s}"),
+                    format!("Invalid bracketed IPv6 address: {s}"),
                 )
-            })?;
-            (inner, true)
-        } else {
-            if s.contains(['[', ']']) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Failed to parse address: {s}"),
-                ));
+            };
+            let address_str = bracketed.strip_suffix(']').ok_or_else(invalid)?;
+            if let Ok(address) = address_str.parse::<Ipv6Addr>() {
+                return Ok(Address::Ipv6(address));
             }
-            (s, false)
-        };
+
+            // Scoped bind addresses retain their text because Ipv6Addr has no scope ID.
+            if format!("{s}:0").parse::<SocketAddrV6>().is_ok() {
+                return Ok(Address::Hostname(s.to_string()));
+            }
+            return Err(invalid());
+        }
 
         let mut dots = 0;
         let mut possible_ipv4 = true;
@@ -56,8 +57,7 @@ impl Address {
             }
         }
 
-        if !bracketed
-            && possible_ipv4
+        if possible_ipv4
             && dots == 3
             && let Ok(addr) = s.parse::<Ipv4Addr>()
         {
@@ -68,7 +68,7 @@ impl Address {
             return Ok(Address::Ipv6(addr));
         }
 
-        if !bracketed && possible_hostname {
+        if possible_hostname {
             return Ok(Address::Hostname(s.to_string()));
         }
 
@@ -190,7 +190,6 @@ impl NetLocation {
         Ok(Self { address, port })
     }
 
-    #[cfg(test)]
     pub fn from_ip_addr(ip: IpAddr, port: u16) -> Self {
         let address = match ip {
             IpAddr::V4(addr) => Address::Ipv4(addr),
@@ -264,6 +263,10 @@ impl ResolvedLocation {
     }
 
     /// Create a location with a pre-resolved address.
+    #[allow(
+        dead_code,
+        reason = "Retained for tests; production routing now resolves lazily"
+    )]
     pub fn with_resolved(location: NetLocation, addr: SocketAddr) -> Self {
         Self {
             location,
@@ -341,6 +344,34 @@ impl From<NetLocation> for NetLocationPortRange {
 }
 
 impl NetLocationPortRange {
+    pub(crate) fn may_overlap_socket(&self, socket: SocketAddr) -> bool {
+        self.ports.contains(&socket.port())
+            && match &self.address {
+                Address::Ipv4(ip) => {
+                    ip.is_unspecified()
+                        || socket.ip().is_unspecified()
+                        || socket.ip() == IpAddr::V4(*ip)
+                }
+                Address::Ipv6(ip) => {
+                    ip.is_unspecified()
+                        || socket.ip().is_unspecified()
+                        || socket.ip() == IpAddr::V6(*ip)
+                }
+                Address::Hostname(_) => true,
+            }
+    }
+
+    pub(crate) fn literal_socket_addr(&self) -> Option<SocketAddr> {
+        let &[port] = self.ports.as_slice() else {
+            return None;
+        };
+        match &self.address {
+            Address::Ipv4(ip) => Some(SocketAddr::new(IpAddr::V4(*ip), port)),
+            Address::Ipv6(ip) => Some(SocketAddr::new(IpAddr::V6(*ip), port)),
+            Address::Hostname(host) => format!("{host}:{port}").parse().ok(),
+        }
+    }
+
     pub fn new(address: Address, mut ports: Vec<u16>) -> std::io::Result<Self> {
         ports.sort_unstable();
         ports.dedup();
@@ -587,6 +618,9 @@ impl AddressMask {
 
 impl std::fmt::Display for AddressMask {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if let Address::Hostname(hostname) = &self.address {
+            return f.write_str(hostname);
+        }
         // Convert the 128-bit netmask back to number of bits
         let bits = if self.netmask == 0 {
             0
@@ -724,6 +758,98 @@ impl serde::ser::Serialize for NetLocationMask {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn hostname_masks_serialize_without_cidr_bits() {
+        for input in ["example.com", "example.com:443"] {
+            let mask = NetLocationMask::from(input).unwrap();
+            assert_eq!(mask.to_string(), input);
+            let encoded = serde_yaml::to_string(&mask).unwrap();
+            let decoded: NetLocationMask = serde_yaml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn test_bracketed_ipv6_locations() {
+        for ip in [
+            "::1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2001:db8:1:2:3:4:5:6",
+            "::ffff:192.0.2.1",
+        ] {
+            let address = Address::Ipv6(ip.parse().unwrap());
+            let bracketed = format!("[{ip}]");
+            let authority = format!("{bracketed}:443");
+            let expected = NetLocation::new(address.clone(), 443);
+
+            assert_eq!(Address::from(ip).unwrap(), address);
+            assert_eq!(Address::from(&bracketed).unwrap(), address);
+
+            assert_eq!(
+                NetLocation::from_str(&format!("{ip}:443"), None).unwrap(),
+                expected
+            );
+            assert_eq!(NetLocation::from_str(&authority, None).unwrap(), expected);
+            assert_eq!(
+                NetLocation::from_str(&bracketed, Some(443)).unwrap(),
+                expected
+            );
+            assert_eq!(
+                serde_yaml::from_str::<NetLocation>(&format!("'{authority}'")).unwrap(),
+                expected
+            );
+            assert!(NetLocation::from_str(&bracketed, None).is_err());
+
+            let range = NetLocationPortRange::from_str(&format!("{bracketed}:80,443-444")).unwrap();
+            assert_eq!(range.address, address);
+            assert_eq!(range.ports, [80, 443, 444]);
+        }
+    }
+
+    #[test]
+    fn test_scoped_ipv6_bind_locations() {
+        let ip: Ipv6Addr = "fe80::1".parse().unwrap();
+        for scope_id in [0, 2, u32::MAX] {
+            let address_str = format!("[{ip}%{scope_id}]");
+            let range =
+                NetLocationPortRange::from_str(&format!("{address_str}:8080-8081")).unwrap();
+            assert_eq!(range.address, Address::Hostname(address_str));
+            assert_eq!(
+                range.to_socket_addrs().unwrap(),
+                [
+                    SocketAddr::V6(SocketAddrV6::new(ip, 8080, 0, scope_id)),
+                    SocketAddr::V6(SocketAddrV6::new(ip, 8081, 0, scope_id)),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_bracketed_ipv6_rejects_invalid_addresses() {
+        for address in [
+            "[]",
+            "[example.com]",
+            "[127.0.0.1]",
+            "[::1",
+            "[invalid]",
+            "[fe80::1%]",
+            "[fe80::1%eth0]",
+            "[fe80::1%4294967296]",
+        ] {
+            assert!(Address::from(address).is_err(), "{address}");
+            let authority = format!("{address}:443");
+            assert!(
+                NetLocation::from_str(&authority, None).is_err(),
+                "{authority}"
+            );
+            assert!(
+                NetLocationPortRange::from_str(&authority).is_err(),
+                "{authority}"
+            );
+        }
+    }
 
     #[test]
     fn test_netlocation_serialization() {

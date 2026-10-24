@@ -77,29 +77,61 @@ impl NaiveProxyTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for NaiveProxyTcpClientHandler {
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> io::Result<Option<TcpClientSetupResult>> {
+        let session = {
+            // A cold handshake holds this lock; preflight must not wait behind it.
+            let Ok(slot) = self.session.try_lock() else {
+                return Ok(None);
+            };
+            slot.as_ref().filter(|session| session.is_ready()).cloned()
+        };
+        match session {
+            Some(session) => self.open_stream(session, target).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> io::Result<TcpClientSetupResult> {
-        let mut session = self.get_or_create_session(client_stream).await?;
+        let session = self.get_or_create_session(client_stream).await?;
+        self.open_stream(session, &remote_location).await
+    }
+}
 
-        let stream = session
-            .open_stream(
-                remote_location.location(),
-                &self.auth_header,
-                self.padding_enabled,
-            )
-            .await?;
+impl NaiveProxyTcpClientHandler {
+    async fn open_stream(
+        &self,
+        mut session: NaiveClientSession,
+        target: &ResolvedLocation,
+    ) -> io::Result<TcpClientSetupResult> {
+        let result = session
+            .open_stream(target.location(), &self.auth_header, self.padding_enabled)
+            .await;
+        let stream = match result {
+            Ok(stream) => stream,
+            Err(e) => {
+                let mut slot = self.session.lock().await;
+                if slot
+                    .as_ref()
+                    .is_some_and(|current| current.same_generation(&session))
+                {
+                    *slot = None;
+                }
+                return Err(e);
+            }
+        };
 
         Ok(TcpClientSetupResult {
             client_stream: stream,
             early_data: None,
         })
     }
-}
-
-impl NaiveProxyTcpClientHandler {
     /// Get an existing session or create a new one, returning a clone.
     ///
     /// The session is cloned so we can release the lock before calling open_stream.
@@ -129,6 +161,181 @@ impl NaiveProxyTcpClientHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reuse_miss_does_not_wait_for_a_cold_handshake() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let _guard = handler.session.lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handler.try_reuse_tcp_stream(&target),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_warm_open_cannot_retire_a_replacement_session() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let (client, peer) = tokio::io::duplex(8192);
+        handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            arrived.send(()).unwrap();
+            released.await.unwrap();
+            respond
+                .send_response(
+                    http::Response::builder().status(503).body(()).unwrap(),
+                    true,
+                )
+                .unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let opener = handler.clone();
+        let opening = tokio::spawn(async move {
+            let target = crate::address::NetLocation::from_str("example.com:443", None)
+                .unwrap()
+                .into();
+            opener.try_reuse_tcp_stream(&target).await
+        });
+        arrival.await.unwrap();
+        assert!(handler.session.try_lock().is_ok());
+        let (transport, _peer) = tokio::io::duplex(8192);
+        let replacement = NaiveClientSession::new(Box::new(transport)).await.unwrap();
+        *handler.session.lock().await = Some(replacement.clone());
+        release.send(()).unwrap();
+        assert!(opening.await.unwrap().is_err());
+        assert!(
+            handler
+                .session
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .same_generation(&replacement)
+        );
+        peer.abort();
+        let _ = peer.await;
+    }
+
+    #[tokio::test]
+    async fn rejected_connect_does_not_discard_retired_tunnels_tail() {
+        use bytes::Bytes;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, peer) = tokio::io::duplex(65536);
+        let peer = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(peer).await.unwrap();
+            let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let mut receive = request.into_body();
+            let read = async {
+                let warmup = receive.data().await.unwrap().unwrap();
+                assert_eq!(warmup, b"warmup"[..]);
+                receive
+                    .flow_control()
+                    .release_capacity(warmup.len())
+                    .unwrap();
+                send.send_data(Bytes::new(), true).unwrap();
+                let mut tail = Vec::new();
+                while let Some(data) = receive.data().await {
+                    let data = data.unwrap();
+                    receive.flow_control().release_capacity(data.len()).unwrap();
+                    tail.extend_from_slice(&data);
+                }
+                tail
+            };
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    tail = &mut read => break tail,
+                    accepted = connection.accept() => match accepted {
+                        Some(Ok((_, mut respond))) => {
+                            let response = http::Response::builder().status(503).body(()).unwrap();
+                            respond.send_response(response, true).unwrap();
+                        }
+                        _ => break read.await,
+                    }
+                }
+            }
+        });
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let target = crate::address::NetLocation::from_str("example.com:443", None).unwrap();
+        let mut stream = handler
+            .setup_client_tcp_stream(Box::new(client), target.clone().into())
+            .await
+            .unwrap()
+            .client_stream;
+        stream.write_all(b"warmup").await.unwrap();
+        stream.read_to_end(&mut Vec::new()).await.unwrap();
+        let result = handler.try_reuse_tcp_stream(&target.into()).await;
+        assert!(result.is_err());
+        assert!(handler.session.lock().await.is_none());
+        stream.write_all(b"FINAL-TAIL").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail, b"FINAL-TAIL");
+    }
+
+    #[tokio::test]
+    async fn replaces_closed_session_with_supplied_transport() {
+        let handler = NaiveProxyTcpClientHandler::new("user", "pass", false);
+        let (client, peer) = tokio::io::duplex(8192);
+        let first = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while first.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        assert!(
+            handler
+                .try_reuse_tcp_stream(&target)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (client, _peer) = tokio::io::duplex(8192);
+        let second = handler
+            .get_or_create_session(Box::new(client))
+            .await
+            .unwrap();
+        assert!(second.is_ready());
+        assert!(!first.same_generation(&second));
+    }
 
     #[test]
     fn test_handler_new_encodes_credentials() {

@@ -1,13 +1,15 @@
 //! Server configuration types.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
 use crate::address::NetLocation;
 use crate::option_util::{NoneOrSome, OneOrSome};
 
-use super::common::{default_reality_server_short_ids, default_reality_time_diff, default_true};
+use super::common::{
+    default_reality_server_short_ids, default_reality_time_diff, default_true, is_false,
+};
 use super::dns::DnsConfig;
 use super::rules::{ClientChainHop, RuleConfig};
 use super::selection::ConfigSelection;
@@ -156,6 +158,10 @@ pub fn direct_allow_rule() -> NoneOrSome<ConfigSelection<RuleConfig>> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sniff: bool,
     #[serde(flatten)]
     pub bind_location: BindLocation,
     pub protocol: ServerProxyConfig,
@@ -194,6 +200,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .ok_or_else(|| Error::custom("ServerConfig must be a YAML mapping"))?;
 
         const VALID_FIELDS: &[&str] = &[
+            "name",
             "address",
             "addresses",
             "path", // BindLocation (flattened)
@@ -204,6 +211,7 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             "rules",
             "rule",
             "dns",
+            "sniff",
         ];
 
         // Check for unknown fields
@@ -219,22 +227,6 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             }
         }
 
-        // Parse bind_location (flattened - either address or path)
-        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Address)
-                .map_err(|e| Error::custom(format!("invalid address: {e}")))?
-        } else if let Some(v) = map.get("path") {
-            serde_yaml::from_value(v.clone())
-                .map(BindLocation::Path)
-                .map_err(|e| Error::custom(format!("invalid path: {e}")))?
-        } else {
-            return Err(Error::custom(
-                "server config must have 'address', 'addresses', or 'path' field",
-            ));
-        };
-
-        // Parse protocol (required)
         let protocol: ServerProxyConfig = map
             .get("protocol")
             .ok_or_else(|| Error::custom("missing 'protocol' field in server config"))
@@ -242,6 +234,41 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
                 serde_yaml::from_value(v.clone())
                     .map_err(|e| Error::custom(format!("invalid protocol: {e}")))
             })?;
+        let is_wireguard = matches!(protocol, ServerProxyConfig::Wireguard(_));
+        if is_wireguard
+            && ["address", "addresses", "path"]
+                .into_iter()
+                .filter(|field| map.contains_key(*field))
+                .count()
+                > 1
+        {
+            return Err(Error::custom(
+                "WireGuard server must specify only one of address, addresses, or path",
+            ));
+        }
+
+        // Parse bind_location (flattened - either address or path)
+        let bind_location = if let Some(v) = map.get("address").or_else(|| map.get("addresses")) {
+            if is_wireguard {
+                // Checks literal syntax before range parsing can collapse duplicate ports.
+                let _: OneOrSome<SocketAddr> = serde_yaml::from_value(v.clone()).map_err(|_| {
+                    Error::custom("WireGuard server requires one literal UDP socket address")
+                })?;
+            }
+            serde_yaml::from_value(v.clone())
+                .map(BindLocation::Address)
+                .map_err(|e| Error::custom(format!("invalid address: {e}")))?
+        } else if let Some(v) = map.get("path") {
+            serde_yaml::from_value(v.clone())
+                .map(BindLocation::Path)
+                .map_err(|e| Error::custom(format!("invalid path: {e}")))?
+        } else if is_wireguard {
+            BindLocation::Unspecified {}
+        } else {
+            return Err(Error::custom(
+                "server config must have 'address', 'addresses', or 'path' field",
+            ));
+        };
 
         // Parse transport (optional, default)
         let transport: Transport = map
@@ -249,7 +276,13 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map(|v| serde_yaml::from_value(v.clone()))
             .transpose()
             .map_err(|e| Error::custom(format!("invalid transport: {e}")))?
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if is_wireguard {
+                    Transport::Udp
+                } else {
+                    Transport::default()
+                }
+            });
 
         // Parse tcp_settings (optional, skip if null)
         let tcp_settings: Option<TcpConfig> = map
@@ -275,7 +308,13 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .map(|v| serde_yaml::from_value(v.clone()))
             .transpose()
             .map_err(|e| Error::custom(format!("invalid rules: {e}")))?
-            .unwrap_or_else(direct_allow_rule);
+            .unwrap_or_else(|| {
+                if is_wireguard {
+                    NoneOrSome::None
+                } else {
+                    direct_allow_rule()
+                }
+            });
 
         // Parse dns (optional)
         let dns: Option<DnsConfig> = map
@@ -285,7 +324,20 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
             .transpose()
             .map_err(|e| Error::custom(format!("invalid dns: {e}")))?;
 
+        let sniff = map
+            .get("sniff")
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()
+            .map_err(|e| Error::custom(format!("invalid sniff: {e}")))?
+            .unwrap_or(false);
+
         Ok(ServerConfig {
+            name: map
+                .get("name")
+                .map(|v| serde_yaml::from_value(v.clone()))
+                .transpose()
+                .map_err(Error::custom)?,
+            sniff,
             bind_location,
             protocol,
             transport,
@@ -299,6 +351,8 @@ impl<'de> serde::de::Deserialize<'de> for ServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RealityServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mldsa65_seed: Option<String>,
     /// X25519 private key (32 bytes, base64url encoded)
     pub private_key: String,
 
@@ -348,7 +402,18 @@ pub struct RealityServerConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TlsServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_source: Option<String>,
+    #[serde(skip)]
+    pub certificate_binding: Option<std::sync::Arc<crate::certificates::Source>>,
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
+    #[serde(default)]
     pub cert: String,
+    #[serde(default)]
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
@@ -389,6 +454,7 @@ pub struct TlsServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShadowTlsServerConfig {
     pub password: String,
     pub handshake: ShadowTlsServerHandshakeConfig,
@@ -638,6 +704,9 @@ impl WebsocketPingType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ServerProxyConfig {
+    Wireguard(Box<super::wireguard::WireguardServerConfig>),
+    #[serde(alias = "splithttp")]
+    Xhttp(super::xhttp::XhttpServerConfig),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -673,6 +742,22 @@ pub enum ServerProxyConfig {
     },
     Vless {
         user_id: String,
+        #[serde(
+            default,
+            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
+        )]
+        decryption: super::vless::VlessEncryptionSetting,
+        #[serde(
+            default,
+            rename = "encryption",
+            skip_serializing,
+            deserialize_with = "super::vless::reject_server_encryption"
+        )]
+        _invalid_encryption: (),
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vision: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encryption_limits: Option<super::vless::VlessEncryptionLimits>,
         #[serde(default = "default_true")]
         udp_enabled: bool,
         /// Fallback destination for failed authentication (optional)
@@ -785,6 +870,7 @@ pub enum ServerProxyConfig {
 impl std::fmt::Display for ServerProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Wireguard(_) => write!(f, "WireGuard"),
             Self::Http { .. } => write!(f, "HTTP"),
             Self::Socks { .. } => write!(f, "SOCKS"),
             Self::Shadowsocks { .. } => write!(f, "Shadowsocks"),
@@ -821,6 +907,7 @@ impl std::fmt::Display for ServerProxyConfig {
             }
             Self::Vmess { .. } => write!(f, "Vmess"),
             Self::Websocket { .. } => write!(f, "Websocket"),
+            Self::Xhttp(..) => write!(f, "XHTTP"),
             Self::PortForward { .. } => write!(f, "Portforward"),
             Self::Hysteria2 { .. } => write!(f, "Hysteria2"),
             Self::TuicV5 { .. } => write!(f, "TuicV5"),
@@ -837,8 +924,54 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
 
+    #[test]
+    fn sniff_config_defaults_and_round_trips() {
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(base: &str) {
+            let config: T = serde_yaml::from_str(base).unwrap();
+            let value = serde_yaml::to_value(config).unwrap();
+            assert!(value.get("sniff").is_none());
+            for enabled in [false, true] {
+                let yaml = format!("{base}\nsniff: {enabled}\n");
+                let config: T = serde_yaml::from_str(&yaml).unwrap();
+                let value = serde_yaml::to_value(config).unwrap();
+                assert_eq!(
+                    value.get("sniff").and_then(|v| v.as_bool()),
+                    enabled.then_some(true)
+                );
+                let round_trip: T = serde_yaml::from_value(value).unwrap();
+                assert_eq!(
+                    serde_yaml::to_value(round_trip)
+                        .unwrap()
+                        .get("sniff")
+                        .and_then(|v| v.as_bool()),
+                    enabled.then_some(true)
+                );
+            }
+            for value in ["null", "1", "{}", "[tls]", "'true'"] {
+                assert!(serde_yaml::from_str::<T>(&format!("{base}\nsniff: {value}\n")).is_err());
+            }
+            assert!(serde_yaml::from_str::<T>(&format!("{base}\nsnif: true\n")).is_err());
+        }
+        check::<ServerConfig>("address: '127.0.0.1:1080'\nprotocol: {type: socks}");
+        check::<super::super::tun::TunConfig>("mtu: 1500");
+        check::<ServerConfig>(
+            "address: '127.0.0.1:51820'\nprotocol: {type: wireguard, private_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=', addresses: [], peers: []}\nrules: []",
+        );
+        crate::config::create_server_configs(
+            serde_yaml::from_str(include_str!("../../../examples/sni_sniffing.yaml")).unwrap(),
+        )
+        .unwrap();
+        crate::config::create_server_configs(
+            serde_yaml::from_str(include_str!("../../../examples/http_host_sniffing.yaml"))
+                .unwrap(),
+        )
+        .unwrap();
+    }
+
     fn create_test_server_config_http() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
             protocol: ServerProxyConfig::Http {
@@ -855,6 +988,8 @@ mod tests {
 
     fn create_test_server_config_socks() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 1080)
                 .into(),
             protocol: ServerProxyConfig::Socks {
@@ -872,6 +1007,8 @@ mod tests {
 
     fn create_test_server_config_shadowsocks() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: BindLocation::Path(PathBuf::from("/tmp/ss.sock")),
             protocol: ServerProxyConfig::Shadowsocks {
                 config: ShadowsocksConfig::Legacy {
@@ -890,6 +1027,8 @@ mod tests {
 
     fn create_test_server_config_vless() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
                 443,
@@ -897,12 +1036,19 @@ mod tests {
             .into(),
             protocol: ServerProxyConfig::Vless {
                 user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                decryption: Default::default(),
+                _invalid_encryption: (),
+                vision: false,
+                encryption_limits: None,
                 udp_enabled: true,
                 fallback: None,
             },
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
+                key_exchange_groups: Default::default(),
                 cert: "server.crt".to_string(),
                 key: "server.key".to_string(),
                 alpn_protocols: NoneOrSome::Some(vec!["h3".to_string()]),
@@ -917,6 +1063,8 @@ mod tests {
 
     fn create_test_server_config_trojan() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
                 443,
@@ -942,6 +1090,9 @@ mod tests {
         tls_targets.insert(
             "example.com".to_string(),
             TlsServerConfig {
+                certificate_source: None,
+                certificate_binding: None,
+                key_exchange_groups: Default::default(),
                 cert: "example.crt".to_string(),
                 key: "example.key".to_string(),
                 alpn_protocols: NoneOrSome::Some(vec!["h2".to_string(), "http/1.1".to_string()]),
@@ -959,9 +1110,14 @@ mod tests {
         ServerConfig {
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8443)
                 .into(),
+            name: None,
+            sniff: false,
             protocol: ServerProxyConfig::Tls {
                 tls_targets,
                 default_tls_target: Some(Box::new(TlsServerConfig {
+                    certificate_source: None,
+                    certificate_binding: None,
+                    key_exchange_groups: Default::default(),
                     cert: "default.crt".to_string(),
                     key: "default.key".to_string(),
                     alpn_protocols: NoneOrSome::None,
@@ -988,6 +1144,8 @@ mod tests {
 
     fn create_test_server_config_vmess() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(
                 IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
                 10086,
@@ -1008,6 +1166,8 @@ mod tests {
 
     fn create_test_server_config_websocket() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
                 .into(),
             protocol: ServerProxyConfig::Websocket {
@@ -1032,6 +1192,8 @@ mod tests {
 
     fn create_test_server_config_port_forward() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9090)
                 .into(),
             protocol: ServerProxyConfig::PortForward {
@@ -1050,6 +1212,8 @@ mod tests {
 
     fn create_test_server_config_hysteria2() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443)
                 .into(),
             protocol: ServerProxyConfig::Hysteria2 {
@@ -1059,6 +1223,9 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
+                key_exchange_groups: Default::default(),
                 cert: "hysteria.crt".to_string(),
                 key: "hysteria.key".to_string(),
                 alpn_protocols: NoneOrSome::One("hysteria".to_string()),
@@ -1073,6 +1240,8 @@ mod tests {
 
     fn create_test_server_config_tuic() -> ServerConfig {
         ServerConfig {
+            name: None,
+            sniff: false,
             bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8443)
                 .into(),
             protocol: ServerProxyConfig::TuicV5 {
@@ -1083,6 +1252,9 @@ mod tests {
             transport: Transport::Quic,
             tcp_settings: None,
             quic_settings: Some(ServerQuicConfig {
+                certificate_source: None,
+                certificate_binding: None,
+                key_exchange_groups: Default::default(),
                 cert: "tuic.crt".to_string(),
                 key: "tuic.key".to_string(),
                 alpn_protocols: NoneOrSome::None,

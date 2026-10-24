@@ -2,7 +2,7 @@
 //!
 //! This module provides UDP relay functionality for SOCKS5 UDP ASSOCIATE.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -141,8 +141,8 @@ pub fn parse_socks5_udp_packet(data: &[u8]) -> std::io::Result<(NetLocation, &[u
 
 /// Encode a SOCKS5 UDP packet with the given source address and payload.
 ///
-/// Returns the complete packet ready to send to the client.
-pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8> {
+/// Replaces the output with the complete packet ready to send to the client.
+pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8], packet: &mut Vec<u8>) {
     let (address, port) = source.components();
 
     let addr_size = match address {
@@ -151,7 +151,8 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
         Address::Hostname(h) => 1 + 1 + h.len(), // ATYP + len + domain
     };
     let header_size = 2 + 1 + addr_size + 2; // RSV + FRAG + addr + PORT
-    let mut packet = Vec::with_capacity(header_size + payload.len());
+    packet.clear();
+    packet.reserve(header_size + payload.len());
 
     packet.extend_from_slice(&[0, 0, 0]); // RSV + FRAG
 
@@ -173,8 +174,6 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
 
     packet.extend_from_slice(&port.to_be_bytes());
     packet.extend_from_slice(payload);
-
-    packet
 }
 
 /// SOCKS5 UDP relay stream.
@@ -188,12 +187,13 @@ pub fn encode_socks5_udp_packet(source: &NetLocation, payload: &[u8]) -> Vec<u8>
 ///   and sends it to the client.
 pub struct Socks5UdpRelayStream {
     socket: Arc<UdpSocket>,
-    /// The client's UDP address, learned from the first received packet.
+    /// The client's UDP address, learned from the first valid, non-empty packet.
     client_addr: Option<SocketAddr>,
     /// Receiver for incoming packets from the socket reader task.
     receiver: mpsc::Receiver<(Box<[u8]>, SocketAddr)>,
     /// Handle to the socket reader task.
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    write_buf: Vec<u8>,
 }
 
 impl Socks5UdpRelayStream {
@@ -236,6 +236,7 @@ impl Socks5UdpRelayStream {
             client_addr: None,
             receiver: rx,
             reader_task: Some(reader_task),
+            write_buf: Vec::new(),
         }
     }
 }
@@ -250,22 +251,17 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
 
         match Pin::new(&mut this.receiver).poll_recv(cx) {
             Poll::Ready(Some((packet, from_addr))) => {
-                // Learn/verify client address
-                if let Some(expected) = this.client_addr {
-                    if from_addr != expected {
-                        // Packet from unexpected source, ignore
-                        log::debug!(
-                            "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
-                            from_addr,
-                            expected
-                        );
-                        cx.waker().wake_by_ref();
-                        return Poll::Pending;
-                    }
-                } else {
-                    // Learn client address from first packet
-                    log::debug!("SOCKS5 UDP relay: learned client address: {}", from_addr);
-                    this.client_addr = Some(from_addr);
+                if let Some(expected) = this.client_addr
+                    && from_addr != expected
+                {
+                    // Packet from unexpected source, ignore
+                    log::debug!(
+                        "SOCKS5 UDP relay: ignoring packet from {} (expected {})",
+                        from_addr,
+                        expected
+                    );
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
 
                 match parse_socks5_udp_packet(&packet) {
@@ -291,6 +287,7 @@ impl AsyncReadTargetedMessage for Socks5UdpRelayStream {
                                 ),
                             )));
                         }
+                        this.client_addr = Some(from_addr);
                         buf.put_slice(payload);
                         Poll::Ready(Ok(target))
                     }
@@ -319,7 +316,7 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
@@ -334,30 +331,24 @@ impl AsyncWriteSourcedMessage for Socks5UdpRelayStream {
             }
         };
 
-        // Convert SocketAddr to NetLocation for encoding.
         // Handle IPv4-mapped IPv6 addresses (::ffff:w.x.y.z) by converting back to IPv4.
-        let source_ip = source.ip();
-        let address = match source_ip {
-            IpAddr::V4(v4) => Address::Ipv4(v4),
-            IpAddr::V6(v6) => {
-                if let Some(v4) = v6.to_ipv4_mapped() {
-                    Address::Ipv4(v4)
-                } else {
-                    Address::Ipv6(v6)
-                }
+        let address = match source.address() {
+            Address::Ipv6(v6) if v6.to_ipv4_mapped().is_some() => {
+                Address::Ipv4(v6.to_ipv4_mapped().unwrap())
             }
+            address => address.clone(),
         };
         let source_location = NetLocation::new(address, source.port());
-        let packet = encode_socks5_udp_packet(&source_location, buf);
+        encode_socks5_udp_packet(&source_location, buf, &mut this.write_buf);
 
         log::debug!(
             "SOCKS5 UDP relay: sending {} byte response from {} to client {}",
-            packet.len(),
+            this.write_buf.len(),
             source_location,
             client_addr
         );
 
-        ready!(this.socket.poll_send_to(cx, &packet, client_addr))?;
+        ready!(this.socket.poll_send_to(cx, &this.write_buf, client_addr))?;
         Poll::Ready(Ok(()))
     }
 }
@@ -395,11 +386,98 @@ impl AsyncPing for Socks5UdpRelayStream {
     }
 }
 
-impl AsyncTargetedMessageStream for Socks5UdpRelayStream {}
+impl AsyncTargetedMessageStream for Socks5UdpRelayStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.client_addr
+    }
+}
+
+impl Drop for Socks5UdpRelayStream {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader_task.take() {
+            reader.abort();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_a_valid_nonempty_packet_can_claim_an_association() {
+        for invalid in [vec![0; 2], vec![0, 0, 0, 1, 127, 0, 0, 1, 0, 53]] {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut relay = Socks5UdpRelayStream::new(socket);
+            let (tx, rx) = mpsc::channel(8);
+            relay.receiver = rx;
+            let client: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            let foreign: SocketAddr = "127.0.0.2:5678".parse().unwrap();
+            let target = NetLocation::from_str("127.0.0.1:53", None).unwrap();
+            let mut packet = Vec::new();
+            encode_socks5_udp_packet(&target, b"valid", &mut packet);
+            tx.send((invalid.into_boxed_slice(), foreign))
+                .await
+                .unwrap();
+            tx.send((packet.clone().into_boxed_slice(), client))
+                .await
+                .unwrap();
+            let mut output = [0; 64];
+            let mut output = ReadBuf::new(&mut output);
+            let read_target = std::future::poll_fn(|cx| {
+                Pin::new(&mut relay).poll_read_targeted_message(cx, &mut output)
+            })
+            .await
+            .unwrap();
+            assert_eq!(read_target, target);
+            assert_eq!(output.filled(), b"valid");
+            assert_eq!(relay.client_addr, Some(client));
+            tx.send((packet.clone().into_boxed_slice(), foreign))
+                .await
+                .unwrap();
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            assert!(
+                Pin::new(&mut relay)
+                    .poll_read_targeted_message(&mut cx, &mut output)
+                    .is_pending()
+            );
+            assert_eq!(relay.client_addr, Some(client));
+        }
+    }
+
+    #[test]
+    fn reply_storage_reuses_capacity_without_retaining_previous_packet() {
+        let mut packet = Vec::with_capacity(1024);
+        let pointer = packet.as_ptr();
+        for location in ["[::1]:53", "127.0.0.1:123", "example.com:443"] {
+            let location = NetLocation::from_str(location, None).unwrap();
+            for payload in [b"longer payload".as_slice(), b"", b"short"] {
+                encode_socks5_udp_packet(&location, payload, &mut packet);
+                assert_eq!(packet.as_ptr(), pointer);
+                let (decoded_location, decoded_payload) = parse_socks5_udp_packet(&packet).unwrap();
+                assert_eq!(decoded_location, location);
+                assert_eq!(decoded_payload, payload);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_quiet_relay_releases_reader_and_socket() {
+        let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let relay = Socks5UdpRelayStream::new(socket);
+        let socket = Arc::downgrade(&relay.socket);
+        let reader = relay.reader_task.as_ref().unwrap().abort_handle();
+        tokio::task::yield_now().await;
+        drop(relay);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(socket.upgrade().is_none());
+    }
 
     #[test]
     fn test_parse_ipv4_packet() {
@@ -469,7 +547,8 @@ mod tests {
     #[test]
     fn test_encode_ipv4_packet() {
         let location = NetLocation::new(Address::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), 53);
-        let packet = encode_socks5_udp_packet(&location, b"Hello");
+        let mut packet = Vec::new();
+        encode_socks5_udp_packet(&location, b"Hello", &mut packet);
 
         // Verify by parsing it back
         let (parsed_loc, payload) = parse_socks5_udp_packet(&packet).unwrap();
@@ -482,7 +561,8 @@ mod tests {
     fn test_roundtrip_domain() {
         let location = NetLocation::new(Address::Hostname("dns.google".to_string()), 443);
         let original_payload = b"test data";
-        let packet = encode_socks5_udp_packet(&location, original_payload);
+        let mut packet = Vec::new();
+        encode_socks5_udp_packet(&location, original_payload, &mut packet);
 
         let (parsed_loc, payload) = parse_socks5_udp_packet(&packet).unwrap();
         assert_eq!(parsed_loc.address(), location.address());

@@ -194,6 +194,8 @@ where
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct TlsClientConfigTemp {
+        #[serde(default)]
+        key_exchange_groups: super::tls::TlsKeyExchangeGroups,
         #[serde(default = "default_true")]
         verify: bool,
         #[serde(alias = "server_fingerprint", default)]
@@ -228,6 +230,11 @@ where
 
     // Check if deprecated shadowtls_password was used
     if let Some(password) = temp.shadowtls_password {
+        if !temp.key_exchange_groups.is_default() {
+            return Err(Error::custom(
+                "key_exchange_groups requires ordinary TLS, not deprecated shadowtls_password",
+            ));
+        }
         log::warn!(
             "The 'shadowtls_password' field in TLS client configuration is deprecated. \
              Please use 'type: shadowtls' with 'password' field instead. \
@@ -236,6 +243,7 @@ where
 
         // Transform to ShadowTLS variant internally by wrapping protocol
         return Ok(TlsClientConfig {
+            key_exchange_groups: temp.key_exchange_groups,
             verify: temp.verify,
             server_fingerprints: temp.server_fingerprints,
             sni_hostname: temp.sni_hostname.clone(),
@@ -254,6 +262,7 @@ where
 
     // Normal case - no shadowtls_password
     Ok(TlsClientConfig {
+        key_exchange_groups: temp.key_exchange_groups,
         verify: temp.verify,
         server_fingerprints: temp.server_fingerprints,
         sni_hostname: temp.sni_hostname,
@@ -274,9 +283,30 @@ where
     deserialize_tls_client_config(deserializer)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+fn deserialize_shadowtls_variant<'de, D>(
+    deserializer: D,
+) -> Result<(String, Option<String>, Box<ClientProxyConfig>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ShadowTlsFields {
+        password: String,
+        #[serde(default)]
+        sni_hostname: Option<String>,
+        protocol: Box<ClientProxyConfig>,
+    }
+    let fields = ShadowTlsFields::deserialize(deserializer)?;
+    Ok((fields.password, fields.sni_hostname, fields.protocol))
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ClientConfig {
+    #[serde(skip)]
+    pub name: Option<String>,
+    #[serde(skip)]
+    pub control: Option<crate::control::catalog::MemberOrigin>,
     #[serde(default, skip_serializing_if = "NoneOrOne::is_unspecified")]
     pub bind_interface: NoneOrOne<String>,
     #[serde(
@@ -293,9 +323,54 @@ pub struct ClientConfig {
     pub quic_settings: Option<ClientQuicConfig>,
 }
 
+impl<'de> Deserialize<'de> for ClientConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn explicit_transport<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Transport>, D::Error> {
+            Transport::deserialize(deserializer).map(Some)
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            bind_interface: NoneOrOne<String>,
+            #[serde(default = "unspecified_address")]
+            address: NetLocation,
+            protocol: ClientProxyConfig,
+            #[serde(default, deserialize_with = "explicit_transport")]
+            transport: Option<Transport>,
+            tcp_settings: Option<TcpConfig>,
+            quic_settings: Option<ClientQuicConfig>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let transport = fields.transport.unwrap_or_else(|| {
+            if fields.protocol.is_wireguard() {
+                Transport::Udp
+            } else {
+                Transport::Tcp
+            }
+        });
+        Ok(Self {
+            name: fields.name,
+            control: None,
+            bind_interface: fields.bind_interface,
+            address: fields.address,
+            protocol: fields.protocol,
+            transport,
+            tcp_settings: fields.tcp_settings,
+            quic_settings: fields.quic_settings,
+        })
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
+            name: None,
+            control: None,
             bind_interface: NoneOrOne::None,
             address: unspecified_address(),
             protocol: ClientProxyConfig::Direct,
@@ -306,10 +381,37 @@ impl Default for ClientConfig {
     }
 }
 
+impl ClientConfig {
+    pub fn validate_quic_key_exchange(&self, initial_hop: bool) -> std::io::Result<()> {
+        let explicit_groups = self
+            .quic_settings
+            .as_ref()
+            .is_some_and(|settings| !settings.key_exchange_groups.is_default());
+        if explicit_groups
+            && (!initial_hop || self.protocol.is_direct() || self.transport != Transport::Quic)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "QUIC key_exchange_groups requires a non-direct client at chain hop 0 with transport: quic",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpVersion {
+    #[default]
+    H1,
+    H2,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ClientProxyConfig {
     Direct,
+    Wireguard(Box<super::wireguard::WireguardClientConfig>),
     Http {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
@@ -319,6 +421,8 @@ pub enum ClientProxyConfig {
         /// Used when the upstream proxy blocks by hostname.
         #[serde(default, skip_serializing_if = "is_false")]
         resolve_hostname: bool,
+        #[serde(default)]
+        http_version: HttpVersion,
     },
     #[serde(alias = "socks5")]
     Socks {
@@ -346,6 +450,20 @@ pub enum ClientProxyConfig {
     },
     Vless {
         user_id: String,
+        #[serde(
+            default,
+            skip_serializing_if = "super::vless::VlessEncryptionSetting::is_disabled"
+        )]
+        encryption: super::vless::VlessEncryptionSetting,
+        #[serde(
+            default,
+            rename = "decryption",
+            skip_serializing,
+            deserialize_with = "super::vless::reject_client_decryption"
+        )]
+        _invalid_decryption: (),
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        vision: bool,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         udp_enabled: bool,
         /// H2MUX multiplexing configuration
@@ -361,6 +479,8 @@ pub enum ClientProxyConfig {
         h2mux: Option<H2MuxConfig>,
     },
     Reality {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mldsa65_verify: Option<String>,
         public_key: String,
         #[serde(default = "default_reality_client_short_id")]
         short_id: String,
@@ -384,7 +504,10 @@ pub enum ClientProxyConfig {
 
         protocol: Box<ClientProxyConfig>,
     },
-    #[serde(alias = "shadowtls")]
+    #[serde(
+        alias = "shadowtls",
+        deserialize_with = "deserialize_shadowtls_variant"
+    )]
     ShadowTls {
         /// ShadowTLS password for authentication
         password: String,
@@ -410,6 +533,8 @@ pub enum ClientProxyConfig {
     },
     #[serde(alias = "ws")]
     Websocket(WebsocketClientConfig),
+    #[serde(alias = "splithttp")]
+    Xhttp(super::xhttp::XhttpClientConfig),
     #[serde(alias = "noop")]
     PortForward,
     /// AnyTLS outbound protocol
@@ -438,6 +563,10 @@ pub enum ClientProxyConfig {
 }
 
 impl ClientProxyConfig {
+    pub fn is_wireguard(&self) -> bool {
+        matches!(self, Self::Wireguard(_))
+    }
+
     pub fn is_direct(&self) -> bool {
         matches!(self, ClientProxyConfig::Direct)
     }
@@ -446,6 +575,7 @@ impl ClientProxyConfig {
     pub fn protocol_name(&self) -> &str {
         match self {
             ClientProxyConfig::Direct => "Direct",
+            ClientProxyConfig::Wireguard(_) => "WireGuard",
             ClientProxyConfig::Http { .. } => "HTTP",
             ClientProxyConfig::Socks { .. } => "SOCKS5",
             ClientProxyConfig::Shadowsocks { .. } => "Shadowsocks",
@@ -457,6 +587,7 @@ impl ClientProxyConfig {
             ClientProxyConfig::ShadowTls { .. } => "ShadowTLS",
             ClientProxyConfig::Vmess { .. } => "VMess",
             ClientProxyConfig::Websocket(..) => "WebSocket",
+            ClientProxyConfig::Xhttp(..) => "XHTTP",
             ClientProxyConfig::PortForward => "PortForward",
             ClientProxyConfig::Anytls { .. } => "AnyTLS",
             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
@@ -466,6 +597,11 @@ impl ClientProxyConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TlsClientConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verify: bool,
     #[serde(
@@ -516,6 +652,8 @@ mod tests {
 
     fn create_test_client_config() -> ClientConfig {
         ClientConfig {
+            name: None,
+            control: None,
             bind_interface: NoneOrOne::One("eth0".to_string()),
             address: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 1080),
             protocol: ClientProxyConfig::Socks {

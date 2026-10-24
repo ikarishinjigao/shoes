@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::io::{self, Write};
@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::thread;
+use std::time::Duration;
 #[cfg(target_os = "linux")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "linux")]
 const PROCESS_GROUP_TERM_TIMEOUT: Duration = Duration::from_secs(1);
@@ -17,6 +18,13 @@ const PROCESS_GROUP_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(target_os = "linux")]
 const PRIVILEGED_START_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// When set, guards stop children with SIGTERM before SIGKILL on Linux, so instrumented
+/// binaries can write coverage profiles on exit.
+const GRACEFUL_STOP_ENV: &str = "SHOES_TEST_GRACEFUL_STOP";
+
 #[cfg(target_os = "linux")]
 const PRIVILEGED_SESSION_SCRIPT: &str = r#"
 set -eu
@@ -62,6 +70,22 @@ pub struct ProcessGuard {
 }
 
 impl ProcessGuard {
+    pub fn id(&self) -> u32 {
+        self.process.as_ref().unwrap().id()
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child_mut().try_wait()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn process_group_id(&self) -> Option<i32> {
+        match self.cleanup_target {
+            CleanupTarget::ProcessGroup { id, .. } => Some(id),
+            CleanupTarget::Child => None,
+        }
+    }
+
     pub fn new(process: Child, name: impl Into<String>) -> Self {
         let name = name.into();
         eprintln!("[GUARD] Created guard for {} (PID: {})", name, process.id());
@@ -97,7 +121,6 @@ impl ProcessGuard {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn child_mut(&mut self) -> &mut Child {
         self.process.as_mut().expect("process guard has no child")
     }
@@ -132,13 +155,11 @@ impl Drop for ProcessGuard {
 
         match process.try_wait() {
             Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(error) = process.kill()
-                    && error.kind() != io::ErrorKind::InvalidInput
-                {
-                    eprintln!("[GUARD] Could not kill {}: {}", self.name, error);
-                }
-            }
+            Ok(None) => stop_child(
+                &mut process,
+                std::env::var_os(GRACEFUL_STOP_ENV).is_some(),
+                &self.name,
+            ),
             Err(error) => eprintln!("[GUARD] Could not inspect {}: {}", self.name, error),
         }
         if let Err(error) = process.wait() {
@@ -151,8 +172,40 @@ impl Drop for ProcessGuard {
     }
 }
 
+fn stop_child(process: &mut Child, graceful: bool, name: &str) {
+    #[cfg(target_os = "linux")]
+    if graceful && terminate_child(process, GRACEFUL_STOP_TIMEOUT) {
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = graceful;
+    if let Err(error) = process.kill()
+        && error.kind() != io::ErrorKind::InvalidInput
+    {
+        eprintln!("[GUARD] Could not kill {name}: {error}");
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub(crate) fn spawn_privileged_process(
+fn terminate_child(process: &mut Child, timeout: Duration) -> bool {
+    let Ok(process_id) = libc::pid_t::try_from(process.id()) else {
+        return false;
+    };
+    if unsafe { libc::kill(process_id, libc::SIGTERM) } != 0 {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match process.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROCESS_GROUP_POLL_INTERVAL),
+            _ => return false,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn spawn_privileged_process(
     program: &Path,
     name: impl Into<String>,
     configure: impl FnOnce(&mut Command),
@@ -196,7 +249,7 @@ pub(crate) fn spawn_privileged_process(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn spawn_privileged_process(
+pub fn spawn_privileged_process(
     _program: &Path,
     _name: impl Into<String>,
     _configure: impl FnOnce(&mut Command),
@@ -693,25 +746,185 @@ fn validate_mihomo_binary(path: &Path) -> io::Result<String> {
     ))
 }
 
-pub fn start_mihomo_server(config: &str) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+pub async fn start_mihomo_server(
+    config: &str,
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
+    start_mihomo_server_with_env(config, &[]).await
+}
+
+pub async fn start_mihomo_server_with_env(
+    config: &str,
+    environment: &[(&str, &str)],
+) -> io::Result<(ProcessGuard, tempfile::NamedTempFile)> {
     let mut config_file = tempfile::NamedTempFile::new()?;
     config_file.write_all(config.as_bytes())?;
     config_file.flush()?;
 
+    let startup_directory = tempfile::tempdir()?;
+    let ready_file = startup_directory.path().join("ready");
+    let (post_up, ready_path) = if cfg!(windows) {
+        // Go escapes argument quotes for a CRT parser, but cmd.exe needs literal quotes.
+        let mut quoted_path = OsString::from("\"");
+        quoted_path.push(&ready_file);
+        quoted_path.push("\"");
+        ("echo ready>%SHOES_TEST_MIHOMO_READY%", quoted_path)
+    } else {
+        (
+            "printf ready > \"$SHOES_TEST_MIHOMO_READY\"",
+            ready_file.as_os_str().to_owned(),
+        )
+    };
+    // Mihomo accepts SOCKS connections before enabling routing; post-up runs afterward.
     let child = Command::new(find_mihomo_binary()?)
+        .envs(environment.iter().copied())
         .arg("-f")
         .arg(config_file.path())
+        .args(["-post-up", post_up])
+        .env("SHOES_TEST_MIHOMO_READY", ready_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
-    Ok((ProcessGuard::new(child, "mihomo"), config_file))
+    let mut guard = ProcessGuard::new(child, "mihomo");
+    wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(10)).await?;
+    Ok((guard, config_file))
+}
+
+async fn wait_for_mihomo_startup(
+    process: &mut Child,
+    ready_file: &Path,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(status) = process.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "Mihomo exited before routing became ready: {status}"
+                )));
+            }
+            match std::fs::read_to_string(ready_file) {
+                Ok(contents) if contents.trim() == "ready" => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Mihomo routing did not become ready",
+        )
+    })?
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::mpsc;
+
+    /// Runs a shell in `directory` that installs `trap` and then idles for about 20 seconds,
+    /// so a failed stop cannot leak it.
+    fn spawn_shell_with_trap(directory: &Path, trap: &str) -> io::Result<Child> {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{trap}; : > ready; i=0; while [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done"
+            ))
+            .current_dir(directory)
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !directory.join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the child never installed its trap"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(child)
+    }
+
+    #[test]
+    fn graceful_stop_lets_the_child_handle_sigterm() -> io::Result<()> {
+        for graceful in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let mut child =
+                spawn_shell_with_trap(directory.path(), "trap ': > stopped; exit 0' TERM")?;
+            stop_child(&mut child, graceful, "graceful-stop-test");
+            child.wait()?;
+            assert_eq!(
+                directory.path().join("stopped").exists(),
+                graceful,
+                "graceful={graceful}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_stop_falls_back_when_sigterm_is_ignored() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut child = spawn_shell_with_trap(directory.path(), "trap '' TERM")?;
+        stop_child(&mut child, true, "ignored-sigterm-test");
+        assert_eq!(child.wait()?.signal(), Some(libc::SIGKILL));
+        Ok(())
+    }
+
+    fn blocked_startup_process() -> io::Result<ProcessGuard> {
+        let child = Command::new("sh")
+            .args(["-c", "read -r ignored"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        Ok(ProcessGuard::new(child, "startup-test"))
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_waits_for_post_up_marker() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let mut guard = blocked_startup_process()?;
+        let startup =
+            wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(2));
+        tokio::pin!(startup);
+
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        fs::write(&ready_file, "ready\n")?;
+        startup.await
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_reports_early_exit() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let child = Command::new("sh").args(["-c", "exit 7"]).spawn()?;
+        let mut guard = ProcessGuard::new(child, "startup-exit-test");
+        let error = wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("exited before routing became ready")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mihomo_startup_has_bounded_deadline() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let ready_file = directory.path().join("ready");
+        let mut guard = blocked_startup_process()?;
+        let error =
+            wait_for_mihomo_startup(guard.child_mut(), &ready_file, Duration::from_millis(25))
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        Ok(())
+    }
 
     const NESTED_SERVICE_SCRIPT: &str = r#"
 set -eu

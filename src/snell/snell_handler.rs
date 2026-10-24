@@ -1,15 +1,17 @@
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use argon2::{Config as Argon2Config, ThreadMode, Variant, Version};
 use async_trait::async_trait;
 use log::debug;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
 use super::snell_fixed_target_stream::SnellFixedTargetStream;
 use super::snell_udp_stream::{SnellUdpClientStream, SnellUdpStream};
 use crate::address::{Address, NetLocation, ResolvedLocation};
-use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncReadMessage};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
@@ -21,6 +23,21 @@ use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
 use crate::util::write_all;
+
+const SNELL_SALT_LEN: usize = 16;
+
+// Handshake reads must not coalesce the following UDP packet into the header buffer.
+struct HeaderReader<'a>(&'a mut ShadowsocksStream);
+
+impl AsyncRead for HeaderReader<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.get_mut().0).poll_read_message(cx, buf)
+    }
+}
 
 // Snell protocol Argon2 parameters
 // ref: https://github.com/icpz/open-snell/blob/master/components/aead/cipher.go#L48
@@ -107,21 +124,22 @@ impl TcpServerHandler for SnellServerHandler {
             server_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         );
 
         let mut stream_reader = StreamReader::new_with_buffer_size(400);
+        let mut header_stream = HeaderReader(&mut server_stream);
 
-        let version = stream_reader.read_u8(&mut server_stream).await?;
+        let version = stream_reader.read_u8(&mut header_stream).await?;
         if version != 1 {
             return Err(std::io::Error::other(format!(
                 "unexpected snell version: {version}"
             )));
         }
 
-        let command_type = stream_reader.read_u8(&mut server_stream).await?;
+        let command_type = stream_reader.read_u8(&mut header_stream).await?;
         let is_udp = match command_type {
             0 => {
                 // Ping command
@@ -148,18 +166,18 @@ impl TcpServerHandler for SnellServerHandler {
             }
         };
 
-        let client_id_len = stream_reader.read_u8(&mut server_stream).await?;
+        let client_id_len = stream_reader.read_u8(&mut header_stream).await?;
         if client_id_len > 0 {
             stream_reader
-                .read_slice(&mut server_stream, client_id_len as usize)
+                .read_slice(&mut header_stream, client_id_len as usize)
                 .await?;
         }
 
         if !is_udp {
-            let hostname_len = stream_reader.read_u8(&mut server_stream).await? as usize;
+            let hostname_len = stream_reader.read_u8(&mut header_stream).await? as usize;
 
             let hostname_and_port_bytes = stream_reader
-                .read_slice(&mut server_stream, hostname_len + 2)
+                .read_slice(&mut header_stream, hostname_len + 2)
                 .await?;
 
             let hostname_str = match std::str::from_utf8(&hostname_and_port_bytes[0..hostname_len])
@@ -193,7 +211,7 @@ impl TcpServerHandler for SnellServerHandler {
 
                 let initial_data = stream_reader.unparsed_data_owned();
 
-                tokio::spawn(async move {
+                return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                     if let Err(e) = handle_h2mux_session(
                         server_stream,
                         initial_data,
@@ -205,9 +223,7 @@ impl TcpServerHandler for SnellServerHandler {
                     {
                         debug!("Snell h2mux session ended: {}", e);
                     }
-                });
-
-                return Ok(TcpServerSetupResult::AlreadyHandled);
+                })));
             }
 
             Ok(TcpServerSetupResult::TcpForward {
@@ -223,10 +239,12 @@ impl TcpServerHandler for SnellServerHandler {
         } else {
             write_all(&mut server_stream, UDP_READY_RESPONSE).await?;
 
+            let peer = server_stream.peer_addr();
             let udp_stream = SnellUdpStream::new(
                 Box::new(server_stream),
                 ShadowsocksStreamType::Aead.max_payload_len(),
-            );
+            )
+            .with_peer(peer);
 
             Ok(TcpServerSetupResult::MultiDirectionalUdp {
                 stream: Box::new(udp_stream),
@@ -269,7 +287,7 @@ impl TcpClientHandler for SnellClientHandler {
             client_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         ));
@@ -338,7 +356,7 @@ impl TcpClientHandler for SnellClientHandler {
             client_stream,
             ShadowsocksStreamType::Aead,
             self.cipher.algorithm(),
-            self.cipher.salt_len(),
+            SNELL_SALT_LEN,
             self.key.clone(),
             None,
         );

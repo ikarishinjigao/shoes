@@ -35,6 +35,80 @@ impl WebsocketTcpServerHandler {
     }
 }
 
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+    use crate::async_stream::test_streams::FlushGatedStream;
+    use crate::client_proxy_selector::ClientProxySelector;
+    use crate::resolver::NativeResolver;
+    use crate::socks_handler::SocksTcpServerHandler;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn upgrade_response_is_flushed_before_inner_handshake() {
+        let handler = WebsocketTcpServerHandler::new(vec![WebsocketServerTarget {
+            matching_path: None,
+            matching_headers: None,
+            ping_type: WebsocketPingType::Disabled,
+            // SOCKS reads the client's greeting before writing anything.
+            handler: Box::new(SocksTcpServerHandler::new(
+                None,
+                false,
+                "0.0.0.0".parse().unwrap(),
+                Arc::new(ClientProxySelector::new(vec![])),
+                Arc::new(NativeResolver::new()),
+            )),
+        }]);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let setup = tokio::spawn(async move {
+            handler
+                .setup_server_stream(Box::new(FlushGatedStream::new(server)))
+                .await
+        });
+
+        let request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: example.com\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "\r\n"
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut status = [0; 12];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut status))
+            .await
+            .expect("upgrade response was not flushed")
+            .unwrap();
+        assert_eq!(&status, b"HTTP/1.1 101");
+        setup.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_request_targets_are_errors_not_panics() {
+        for line in [
+            "GET HTTP/1.1",
+            "GET  HTTP/1.1",
+            "GET / a HTTP/1.1",
+            "POST / HTTP/1.1",
+        ] {
+            let (mut client, server) = tokio::io::duplex(256);
+            client
+                .write_all(format!("{line}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let result = WebsocketTcpServerHandler::new(vec![])
+                .setup_server_stream(Box::new(server))
+                .await;
+            assert!(result.is_err(), "{line}");
+        }
+    }
+}
+
 #[async_trait]
 impl TcpServerHandler for WebsocketTcpServerHandler {
     async fn setup_server_stream(
@@ -42,7 +116,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
         let ParsedHttpData {
-            mut first_line,
+            first_line,
             headers: mut request_headers,
             stream_reader,
         } = ParsedHttpData::parse(&mut server_stream).await?;
@@ -59,11 +133,13 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
                 )));
             }
 
-            // remove ' HTTP/1.x'
-            first_line.truncate(first_line.len() - 9);
-
-            // return the path after 'GET '
-            first_line.split_off(4)
+            let path = first_line
+                .get(4..first_line.len() - 9)
+                .filter(|path| {
+                    !path.is_empty() && !path.bytes().any(|byte| byte.is_ascii_whitespace())
+                })
+                .ok_or_else(|| std::io::Error::other("invalid HTTP request target"))?;
+            path.to_owned()
         };
 
         let websocket_key = request_headers
@@ -119,6 +195,8 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             );
 
             server_stream.write_all(http_response.as_bytes()).await?;
+            // Clients wait for the 101 before sending frames, and inner handlers read first.
+            server_stream.flush().await?;
 
             let websocket_stream = Box::new(WebsocketStream::new(
                 server_stream,
@@ -130,7 +208,7 @@ impl TcpServerHandler for WebsocketTcpServerHandler {
             let mut target_setup_result = handler.setup_server_stream(websocket_stream).await;
 
             if let Ok(ref mut setup_result) = target_setup_result {
-                if matches!(setup_result, TcpServerSetupResult::AlreadyHandled) {
+                if matches!(setup_result, TcpServerSetupResult::Session(_)) {
                     return target_setup_result;
                 }
                 setup_result.set_need_initial_flush(true);
@@ -233,6 +311,14 @@ impl WebsocketTcpClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for WebsocketTcpClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        self.handler.prepare_target(target, resolver).await
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,

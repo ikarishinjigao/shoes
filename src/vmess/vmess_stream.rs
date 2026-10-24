@@ -423,6 +423,12 @@ impl VmessStream {
                     ));
                 }
 
+                if data_len < padding_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "padding exceeds VMess chunk length",
+                    ));
+                }
                 if self.tag_len > 0 && (data_len - padding_len) < self.tag_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -450,7 +456,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     self.unprocessed_pending_len = Some((padding_len, data_len));
                     if self.unprocessed_start_offset == self.unprocessed_end_offset {
                         self.unprocessed_start_offset = 0;
@@ -468,7 +474,7 @@ impl VmessStream {
                 }
 
                 let processed_data_len = data_len - padding_len - self.tag_len;
-                if self.processed_end_offset + processed_data_len >= self.processed_buf.len() {
+                if self.processed_end_offset + processed_data_len > self.processed_buf.len() {
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -917,7 +923,11 @@ impl AsyncPing for VmessStream {
     }
 }
 
-impl AsyncStream for VmessStream {}
+impl AsyncStream for VmessStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
 
 impl AsyncReadMessage for VmessStream {
     fn poll_read_message(
@@ -1158,14 +1168,189 @@ impl AsyncMessageStream for VmessStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_lc_rs::aead::{CHACHA20_POLY1305, UnboundKey};
+    use crate::copy_bidirectional::tests::{copy_response_with_flush_pressure, quota_test_payload};
+    use crate::prepend_stream::PrependStream;
+    use aws_lc_rs::aead::{Algorithm, CHACHA20_POLY1305, UnboundKey};
     use shake::Shake128;
     use shake::digest::{ExtendableOutput, Update};
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn full_output_chunk_is_accepted_with_or_without_pending_length() {
+        for pending in [false, true] {
+            let (transport, _) = tokio::io::duplex(1);
+            let mut stream = response_test_stream(Box::new(transport), None, false, false, None);
+            let len = stream.processed_buf.len();
+            assert!(len <= u16::MAX as usize);
+            stream.unprocessed_buf[..2].copy_from_slice(&(len as u16).to_be_bytes());
+            stream.unprocessed_buf[2..2 + len].fill(42);
+            stream.unprocessed_end_offset = 2 + len;
+            if pending {
+                stream.unprocessed_pending_len = Some((0, len));
+                stream.unprocessed_start_offset = 2;
+            }
+            assert!(matches!(
+                stream.try_decrypt().unwrap(),
+                DecryptState::Success
+            ));
+            assert_eq!(&*stream.processed_buf, vec![42; len]);
+        }
+    }
+
+    #[tokio::test]
+    async fn padding_larger_than_chunk_is_rejected() {
+        let (transport, _) = tokio::io::duplex(1);
+        let mut stream = response_test_stream(Box::new(transport), None, true, true, None);
+        let (padding, mask) =
+            LengthMask::new(create_shake128_reader(&[23; 16]), true).next_values();
+        assert!(padding > 0);
+        stream.unprocessed_buf[..2].copy_from_slice(&mask.to_be_bytes());
+        stream.unprocessed_end_offset = 2;
+        assert!(
+            matches!(stream.try_decrypt(), Err(error) if error.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
 
     fn create_shake128_reader(iv: &[u8]) -> VmessReader {
         let mut hasher = Shake128::default();
         hasher.update(iv);
         hasher.finalize_xof()
+    }
+
+    fn response_test_stream(
+        stream: Box<dyn AsyncStream>,
+        algorithm: Option<&'static Algorithm>,
+        masked: bool,
+        padding: bool,
+        prefix: Option<BytesMut>,
+    ) -> VmessStream {
+        let keys = algorithm.map(|algorithm| {
+            let key = vec![42; algorithm.key_len()];
+            (
+                OpeningKey::new(
+                    UnboundKey::new(algorithm, &key).unwrap(),
+                    VmessNonceSequence::new(&[23; 16]),
+                ),
+                SealingKey::new(
+                    UnboundKey::new(algorithm, &key).unwrap(),
+                    VmessNonceSequence::new(&[23; 16]),
+                ),
+            )
+        });
+        VmessStream::new(
+            stream,
+            false,
+            keys,
+            masked.then(|| create_shake128_reader(&[23; 16])),
+            masked.then(|| create_shake128_reader(&[23; 16])),
+            padding,
+            prefix,
+            None,
+        )
+    }
+
+    async fn check_response_flushes(payload: &[u8]) {
+        // The handler supplies an opaque, already encrypted 38-byte response prefix.
+        let prefix = [0x5a; 38];
+        for algorithm in [None, Some(&AES_128_GCM), Some(&CHACHA20_POLY1305)] {
+            for (masked, padding) in [(false, false), (true, false), (true, true)] {
+                let capture = copy_response_with_flush_pressure(
+                    |stream| async move {
+                        response_test_stream(
+                            stream,
+                            algorithm,
+                            masked,
+                            padding,
+                            Some(BytesMut::from(&prefix[..])),
+                        )
+                    },
+                    payload,
+                )
+                .await;
+                assert!(capture.first_write_offer.starts_with(&prefix));
+                assert!(capture.first_write_offer.len() > prefix.len());
+                assert!(capture.data.starts_with(&prefix));
+
+                let (transport, _) = tokio::io::duplex(1);
+                let mut decoder = response_test_stream(
+                    Box::new(PrependStream::new(
+                        transport,
+                        Some(capture.data[prefix.len()..].into()),
+                    )),
+                    algorithm,
+                    masked,
+                    padding,
+                    None,
+                );
+                let mut decoded = Vec::new();
+                decoder.read_to_end(&mut decoded).await.unwrap();
+                assert_eq!(decoded, payload);
+
+                let mut mask =
+                    masked.then(|| LengthMask::new(create_shake128_reader(&[23; 16]), padding));
+                let tag_len = if algorithm.is_some() {
+                    ENCRYPTION_TAG_LEN
+                } else {
+                    0
+                };
+                let mut frame_start = prefix.len();
+                let mut eof_count = 0;
+                while frame_start < capture.data.len() {
+                    let (padding_len, length_mask) =
+                        mask.as_mut().map_or((0, 0), LengthMask::next_values);
+                    let encoded_len = u16::from_be_bytes(
+                        capture.data[frame_start..frame_start + 2]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let frame_len = usize::from(encoded_len ^ length_mask);
+                    assert!(frame_len >= padding_len + tag_len);
+                    let frame_end = frame_start + 2 + frame_len;
+                    assert!(frame_end <= capture.data.len());
+                    let is_eof = frame_len == padding_len + tag_len;
+                    if frame_start == prefix.len() {
+                        // The first offered write contains a complete body frame, not just its prefix.
+                        assert!(capture.first_write_offer.len() >= frame_end);
+                        assert_eq!(is_eof, payload.is_empty());
+                    }
+                    if is_eof {
+                        eof_count += 1;
+                        assert_eq!(frame_end, capture.data.len());
+                        assert_eq!(
+                            capture.bytes_before_shutdown,
+                            if payload.is_empty() { 0 } else { frame_start }
+                        );
+                        if let Some(key) = &mut decoder.opening_key {
+                            let mut eof_tag =
+                                capture.data[frame_start + 2..frame_end - padding_len].to_vec();
+                            assert!(
+                                key.open_in_place(Aad::empty(), &mut eof_tag)
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    }
+                    frame_start = frame_end;
+                }
+                assert_eq!(eof_count, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn response_header_waits_for_content_across_copier_flushes() {
+        check_response_flushes(b"first response").await;
+    }
+
+    #[tokio::test]
+    async fn response_survives_copier_quota_flushes_and_eof() {
+        let payload = quota_test_payload();
+        check_response_flushes(&payload).await;
+    }
+
+    #[tokio::test]
+    async fn empty_response_pairs_header_with_eof_only_at_shutdown() {
+        check_response_flushes(b"").await;
     }
 
     #[test]

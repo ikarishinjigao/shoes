@@ -22,6 +22,7 @@ use crate::resolver::Resolver as ShoesResolver;
 /// Tuning options for hickory-backed resolvers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HickoryResolverOptions {
+    pub quic_memory_bytes: usize,
     pub ip_strategy: IpStrategy,
     /// Per-request timeout passed to hickory's ResolverOpts.timeout.
     /// None means use hickory's default.
@@ -35,6 +36,7 @@ pub struct HickoryResolverOptions {
 impl Default for HickoryResolverOptions {
     fn default() -> Self {
         Self {
+            quic_memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
             ip_strategy: IpStrategy::default(),
             request_timeout: Some(Duration::from_secs(5)),
             connect_timeout: Duration::from_secs(5),
@@ -47,6 +49,7 @@ impl Default for HickoryResolverOptions {
 /// Uses ProxyRuntimeProvider for all connections (both direct and proxied).
 pub struct HickoryResolver {
     inner: Resolver<ProxyRuntimeProvider>,
+    exchange: Arc<super::exchange::RawDnsExchange>,
     description: String,
 }
 
@@ -210,17 +213,23 @@ impl HickoryResolver {
         options: HickoryResolverOptions,
         description: String,
     ) -> std::io::Result<Self> {
-        let config = ResolverConfig::from_parts(None, vec![], ns_configs);
+        let config = ResolverConfig::from_parts(None, vec![], ns_configs.clone());
         let provider =
-            ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout);
+            ProxyRuntimeProvider::with_bootstrap(chain_group, bootstrap, options.connect_timeout)
+                .with_quic_memory(options.quic_memory_bytes);
 
-        let mut builder = Resolver::builder_with_config(config, provider);
+        let mut builder = Resolver::builder_with_config(config, provider.clone());
         let resolver_opts = builder.options_mut();
         resolver_opts.ip_strategy = options.ip_strategy.to_hickory();
         if let Some(timeout) = options.request_timeout {
             resolver_opts.timeout = timeout;
         }
         resolver_opts.attempts = options.attempts;
+        let exchange = Arc::new(super::exchange::RawDnsExchange::new(
+            ns_configs,
+            provider,
+            resolver_opts.clone(),
+        ));
         let builder =
             builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
         let resolver = builder
@@ -229,12 +238,27 @@ impl HickoryResolver {
 
         Ok(Self {
             inner: resolver,
+            exchange,
             description,
         })
     }
 }
 
 impl ShoesResolver for HickoryResolver {
+    fn exchange(&self, request: Vec<u8>) -> crate::resolver::DnsExchangeFuture {
+        let exchange = self.exchange.clone();
+        Box::pin(async move { exchange.exchange(request).await })
+    }
+
+    fn exchange_with_deadline(
+        &self,
+        request: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> crate::resolver::DnsExchangeFuture {
+        let exchange = self.exchange.clone();
+        Box::pin(async move { exchange.exchange_with_deadline(request, deadline).await })
+    }
+
     fn resolve_location(
         &self,
         location: &NetLocation,
@@ -332,6 +356,7 @@ mod tests {
             request_timeout: Some(Duration::from_secs(3)),
             connect_timeout: Duration::from_secs(1),
             attempts: 1,
+            ..Default::default()
         };
         assert_eq!(opts.ip_strategy, IpStrategy::Ipv4Only);
         assert_eq!(opts.request_timeout, Some(Duration::from_secs(3)));

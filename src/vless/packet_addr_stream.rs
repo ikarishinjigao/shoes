@@ -131,13 +131,23 @@ impl<S: AsyncMessageStream> AsyncReadTargetedMessage for VlessPacketAddrStream<S
 }
 
 impl<S: AsyncMessageStream> AsyncWriteSourcedMessage for VlessPacketAddrStream<S> {
+    fn supports_hostname_source(&self) -> bool {
+        false
+    }
+
     fn poll_write_sourced_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         payload: &[u8],
-        source: &SocketAddr,
+        source: &NetLocation,
     ) -> Poll<Result<()>> {
         let this = self.get_mut();
+        let source = source.to_socket_addr_nonblocking().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported,
+                "PacketAddr UDP replies require an IP address",
+            )
+        })?;
         let header_len = if source.is_ipv4() { 7 } else { 19 };
         if payload.len() > MAX_MESSAGE_SIZE - header_len {
             return Poll::Ready(Err(Error::new(
@@ -147,7 +157,7 @@ impl<S: AsyncMessageStream> AsyncWriteSourcedMessage for VlessPacketAddrStream<S
         }
 
         this.write_buffer.clear();
-        write_packet_addr_header(&mut this.write_buffer, source);
+        write_packet_addr_header(&mut this.write_buffer, &source);
         this.write_buffer.extend_from_slice(payload);
         Pin::new(&mut this.stream).poll_write_message(cx, &this.write_buffer)
     }
@@ -251,9 +261,10 @@ mod tests {
         assert_eq!(output.filled(), inbound_payload);
 
         let source = SocketAddr::from((Ipv6Addr::LOCALHOST, 443));
+        let source_location = NetLocation::from_ip_addr(source.ip(), source.port());
         let response_payload = b"response";
         poll_fn(|cx| {
-            Pin::new(&mut stream).poll_write_sourced_message(cx, response_payload, &source)
+            Pin::new(&mut stream).poll_write_sourced_message(cx, response_payload, &source_location)
         })
         .await
         .unwrap();

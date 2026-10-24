@@ -88,6 +88,68 @@ enum DecryptState {
 
 const METADATA_SIZE: usize = 2 + (2 * TAG_LEN);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_window_is_symmetric_and_inclusive() {
+        for timestamp in [970, 1000, 1030] {
+            assert!(validate_timestamp(timestamp, 1000).is_ok());
+        }
+        for timestamp in [969, 1031, u64::MAX] {
+            assert!(validate_timestamp(timestamp, 1000).is_err());
+        }
+        assert!(validate_timestamp(0, 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_output_buffer_preserves_the_decrypted_length_and_nonce() {
+        let algorithm = &aws_lc_rs::aead::AES_128_GCM;
+        let (transport, _) = tokio::io::duplex(1);
+        let mut stream = ShadowsocksStream::new(
+            Box::new(transport),
+            ShadowsocksStreamType::Aead,
+            algorithm,
+            16,
+            Arc::new(Box::new(super::super::default_key::DefaultKey::new(
+                "test", 16,
+            ))),
+            None,
+        );
+        let mut seal = SealingKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        );
+        stream.opening_key = Some(OpeningKey::new(
+            UnboundKey::new(algorithm, &[7; 16]).unwrap(),
+            IncreasingSequence::new(),
+        ));
+        let mut packet = Vec::new();
+        for plaintext in [&[0, 3][..], b"abc"] {
+            let mut chunk = plaintext.to_vec();
+            seal.seal_in_place_append_tag(Aad::empty(), &mut chunk)
+                .unwrap();
+            packet.extend(chunk);
+        }
+        stream.unprocessed_buf[..packet.len()].copy_from_slice(&packet);
+        stream.unprocessed_end_offset = packet.len();
+        stream.processed_end_offset = stream.processed_buf.len();
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::BufferFull
+        ));
+        assert_eq!(stream.unprocessed_pending_len, Some(3));
+        stream.processed_end_offset = 0;
+        assert!(matches!(
+            stream.try_decrypt().unwrap(),
+            DecryptState::Success
+        ));
+        assert_eq!(&stream.processed_buf[..3], b"abc");
+        assert_eq!(stream.unprocessed_pending_len, None);
+    }
+}
+
 impl ShadowsocksStream {
     pub fn new(
         stream: Box<dyn AsyncStream>,
@@ -222,6 +284,8 @@ impl ShadowsocksStream {
                 }
 
                 if self.processed_end_offset + data_len_no_tag > self.processed_buf.len() {
+                    // The length nonce has already advanced; retry the payload, not its header.
+                    self.unprocessed_pending_len = Some(data_len_no_tag);
                     return Ok(DecryptState::BufferFull);
                 }
 
@@ -252,6 +316,16 @@ impl ShadowsocksStream {
                 &self.unprocessed_buf
                     [self.unprocessed_start_offset..self.unprocessed_start_offset + pending_len],
             );
+
+        if matches!(self.stream_type, ShadowsocksStreamType::Aead)
+            && let Some(salt) = self.decrypt_iv.take()
+            && let Some(checker) = &self.salt_checker
+            && !checker.lock().insert_and_check(&salt)
+        {
+            return Err(std::io::Error::other(
+                "salt replay or replay cache capacity exhausted",
+            ));
+        }
 
         self.processed_end_offset += pending_len;
         self.unprocessed_start_offset += pending_len_with_tag;
@@ -400,11 +474,8 @@ impl ShadowsocksStream {
     fn process_read_header(&mut self) -> std::io::Result<()> {
         match self.stream_type {
             ShadowsocksStreamType::Aead => {
-                if let Some(salt_checker) = &self.salt_checker {
-                    let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
-                    if !salt_checker.lock().insert_and_check(decrypt_iv) {
-                        return Err(std::io::Error::other("got duplicate salt"));
-                    }
+                if self.salt_checker.is_some() {
+                    self.decrypt_iv = Some(self.unprocessed_buf[..self.salt_len].into());
                 }
                 self.process_opening_key()?;
                 self.unprocessed_start_offset += self.salt_len;
@@ -442,21 +513,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
                 if let Some(salt_checker) = &self.salt_checker
@@ -509,21 +566,7 @@ impl ShadowsocksStream {
                 let timestamp_bytes = &self.unprocessed_buf[self.salt_len + 1..self.salt_len + 9];
                 let timestamp_secs = u64::from_be_bytes(timestamp_bytes.try_into().unwrap());
                 let current_time_secs = current_time_secs();
-                if current_time_secs >= timestamp_secs {
-                    if current_time_secs - timestamp_secs > 30 {
-                        return Err(std::io::Error::other(
-                            "timestamp is greater than 30 seconds",
-                        ));
-                    }
-                } else {
-                    // Make sure times aren't too far in the future.
-                    if timestamp_secs - current_time_secs > 2 {
-                        return Err(std::io::Error::other(format!(
-                            "timestamp is {} seconds in the future",
-                            timestamp_secs - current_time_secs
-                        )));
-                    }
-                }
+                validate_timestamp(timestamp_secs, current_time_secs)?;
 
                 if let Some(salt_checker) = &self.salt_checker {
                     let decrypt_iv = &self.unprocessed_buf[0..self.salt_len];
@@ -905,10 +948,200 @@ impl AsyncShutdownMessage for ShadowsocksStream {
     }
 }
 
-impl AsyncStream for ShadowsocksStream {}
+impl AsyncStream for ShadowsocksStream {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        match self.stream_type {
+            ShadowsocksStreamType::Aead => {
+                std::num::NonZeroUsize::new(self.stream_type.max_payload_len())
+            }
+            ShadowsocksStreamType::AEAD2022Server | ShadowsocksStreamType::AEAD2022Client => None,
+        }
+    }
+}
 impl AsyncMessageStream for ShadowsocksStream {}
 
 #[inline]
 fn current_time_secs() -> u64 {
     SystemTime::UNIX_EPOCH.elapsed().unwrap().as_secs()
+}
+
+fn validate_timestamp(timestamp: u64, now: u64) -> std::io::Result<()> {
+    if timestamp.abs_diff(now) > 30 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "timestamp outside the 30-second window",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod flush_tests {
+    use super::*;
+    use crate::copy_bidirectional::tests::{copy_response_with_flush_pressure, quota_test_payload};
+    use crate::prepend_stream::PrependStream;
+    use aws_lc_rs::aead::{AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn check_response_flushes(payload: &[u8]) {
+        for (algorithm, aead2022) in [
+            (&AES_128_GCM, false),
+            (&AES_256_GCM, false),
+            (&CHACHA20_POLY1305, false),
+            (&AES_128_GCM, true),
+            (&AES_256_GCM, true),
+        ] {
+            let salt_len = algorithm.key_len();
+            let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(if aead2022 {
+                Box::new(super::super::blake3_key::Blake3Key::new(
+                    vec![42; salt_len].into_boxed_slice(),
+                    salt_len,
+                ))
+            } else {
+                Box::new(super::super::DefaultKey::new("secret", salt_len))
+            });
+            let (transport, mut peer) = tokio::io::duplex(4096);
+            let mut client = ShadowsocksStream::new(
+                Box::new(transport),
+                if aead2022 {
+                    ShadowsocksStreamType::AEAD2022Client
+                } else {
+                    ShadowsocksStreamType::Aead
+                },
+                algorithm,
+                salt_len,
+                key.clone(),
+                None,
+            );
+            let request = b"\x01\x7f\x00\x00\x01\x00\x50\x00\x00";
+            client.write_all(request).await.unwrap();
+            client.flush().await.unwrap();
+            let metadata_len = if aead2022 {
+                11 + 2 * TAG_LEN
+            } else {
+                METADATA_SIZE
+            };
+            let mut request_wire = vec![0; salt_len + metadata_len + request.len()];
+            peer.read_exact(&mut request_wire).await.unwrap();
+
+            let capture = copy_response_with_flush_pressure(
+                |stream| async move {
+                    let mut server = ShadowsocksStream::new(
+                        Box::new(PrependStream::new(
+                            stream,
+                            Some(request_wire.into_boxed_slice()),
+                        )),
+                        if aead2022 {
+                            ShadowsocksStreamType::AEAD2022Server
+                        } else {
+                            ShadowsocksStreamType::Aead
+                        },
+                        algorithm,
+                        salt_len,
+                        key,
+                        None,
+                    );
+                    let mut received_request = [0; 9];
+                    server.read_exact(&mut received_request).await.unwrap();
+                    assert_eq!(&received_request, request);
+                    server
+                },
+                payload,
+            )
+            .await;
+
+            if payload.is_empty() {
+                assert!(capture.data.is_empty());
+                assert!(capture.first_write_offer.is_empty());
+            } else {
+                let overhead = if aead2022 {
+                    salt_len + 11 + salt_len + 2 * TAG_LEN
+                } else {
+                    salt_len + METADATA_SIZE
+                };
+                assert!(capture.first_write_offer.len() > overhead);
+                if payload.len() < 1024 {
+                    assert_eq!(capture.first_write_offer.len(), overhead + payload.len());
+                }
+            }
+
+            let (transport, _) = tokio::io::duplex(1);
+            client.stream = Box::new(PrependStream::new(
+                transport,
+                Some(capture.data.into_boxed_slice()),
+            ));
+            let mut decoded = Vec::new();
+            client.read_to_end(&mut decoded).await.unwrap();
+            assert_eq!(decoded, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn response_salt_waits_for_content_across_copier_flushes() {
+        check_response_flushes(b"first response").await;
+    }
+
+    #[tokio::test]
+    async fn response_survives_copier_quota_flushes_and_eof() {
+        let payload = quota_test_payload();
+        check_response_flushes(&payload).await;
+    }
+
+    #[tokio::test]
+    async fn empty_response_never_emits_a_salt() {
+        check_response_flushes(b"").await;
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingChecker(Arc<AtomicUsize>);
+    impl SaltChecker for CountingChecker {
+        fn insert_and_check(&mut self, _: &[u8]) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_salt_is_admitted_only_after_payload_authentication() {
+        let key: Arc<Box<dyn ShadowsocksKey>> = Arc::new(Box::new(
+            super::super::default_key::DefaultKey::new("secret", 32),
+        ));
+        let make_stream = |checker| {
+            let (stream, _peer) = tokio::io::duplex(4096);
+            ShadowsocksStream::new(
+                Box::new(stream),
+                ShadowsocksStreamType::Aead,
+                &aws_lc_rs::aead::AES_256_GCM,
+                32,
+                key.clone(),
+                checker,
+            )
+        };
+        let mut writer = make_stream(None);
+        writer.process_write_header(b"hello").unwrap();
+        let wire = writer.write_cache[..writer.write_cache_end_offset].to_vec();
+        for corrupt in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut reader =
+                make_stream(Some(Arc::new(Mutex::new(CountingChecker(calls.clone())))));
+            reader.unprocessed_buf[..wire.len()].copy_from_slice(&wire);
+            reader.unprocessed_end_offset = wire.len();
+            if corrupt {
+                reader.unprocessed_buf[wire.len() - 1] ^= 1;
+            }
+            reader.process_read_header().unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(reader.try_decrypt().is_ok(), !corrupt);
+            assert_eq!(calls.load(Ordering::Relaxed), usize::from(!corrupt));
+        }
+    }
 }

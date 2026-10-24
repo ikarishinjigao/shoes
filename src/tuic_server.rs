@@ -1,16 +1,14 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroUsize;
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use log::{debug, error};
-use lru::LruCache;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -19,10 +17,12 @@ use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::{ClientProxySelector, ConnectDecision};
 use crate::copy_bidirectional::copy_bidirectional_with_sizes;
 use crate::quic_stream::QuicStream;
-use crate::resolver::{Resolver, resolve_single_address};
+use crate::resolver::Resolver;
+use crate::routing::udp_relay::UdpRelay;
 use crate::stream_reader::StreamReader;
-use crate::tcp::tcp_server::setup_client_tcp_stream;
-use crate::util::{allocate_vec, write_all};
+use crate::tcp::ingress::PreparedTcp;
+use crate::udp_fragments::UdpFragments;
+use crate::util::write_all;
 
 const COMMAND_TYPE_AUTHENTICATE: u8 = 0x00;
 const COMMAND_TYPE_CONNECT: u8 = 0x01;
@@ -34,12 +34,7 @@ const COMMAND_TYPE_HEARTBEAT: u8 = 0x04;
 const MAX_ADDRESS_BYTES_LEN: usize = 1 + 1 + 255 + 2;
 const MAX_HEADER_LEN: usize = 2 + 2 + 1 + 1 + 2 + MAX_ADDRESS_BYTES_LEN;
 
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Maximum number of fragmented packets to track per connection.
-/// Old entries are automatically evicted when this limit is reached.
-const MAX_FRAGMENT_CACHE_SIZE: usize = 256;
 
 /// Authentication timeout - close connection if client doesn't authenticate within this time.
 /// Default is 3 seconds per sing-box reference implementation.
@@ -49,14 +44,32 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default is 10 seconds per sing-box reference implementation.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-type UdpSessionMap = Arc<DashMap<u16, UdpSession>>;
+type UdpSessionMap = Arc<UdpState>;
+
+struct UdpState {
+    sessions: DashMap<u16, Arc<UdpSession>>,
+    fragments: parking_lot::Mutex<UdpFragments<(u16, u16)>>,
+    slots: Arc<crate::resources::Budget>,
+}
+
+impl UdpState {
+    fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+            fragments: parking_lot::Mutex::new(UdpFragments::new()),
+            slots: Arc::new(crate::resources::Budget::new(
+                crate::resources::limits().max_udp_destinations,
+            )),
+        }
+    }
+}
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
-    uuid: &'static [u8],
-    password: &'static str,
-    conn: quinn::Incoming,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
+    conn: quinn::Connecting,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<()> {
     // Accept the incoming connection. When 0-RTT is enabled, use into_0rtt() to
@@ -65,11 +78,8 @@ async fn process_connection(
     // to replay attacks, though for incoming server connections it's 0.5-RTT which
     // is safer but still shouldn't be used for client-authenticated data).
     let connection = if zero_rtt_handshake {
-        let connecting = conn
-            .accept()
-            .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
         // For incoming connections, into_0rtt() always succeeds per quinn docs
-        let (connection, _zero_rtt_accepted) = connecting
+        let (connection, _zero_rtt_accepted) = conn
             .into_0rtt()
             .map_err(|_| std::io::Error::other("failed to enable 0-RTT"))?;
         connection
@@ -79,7 +89,7 @@ async fn process_connection(
 
     // Authentication with timeout - per sing-box reference, default 3 seconds.
     // This prevents malicious clients from holding connections open without authenticating.
-    match timeout(AUTH_TIMEOUT, auth_connection(&connection, uuid, password)).await {
+    match timeout(AUTH_TIMEOUT, auth_connection(&connection, &uuid, &password)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             connection.close(0u32.into(), b"auth failed");
@@ -98,12 +108,13 @@ async fn process_connection(
     // Create a cancellation token for the entire connection lifecycle.
     // When cancelled, all spawned tasks (UDP sessions, cleanup task, heartbeat) will terminate gracefully.
     let cancel_token = CancellationToken::new();
+    let _cancel_on_drop = cancel_token.clone().drop_guard();
 
     // this allows for:
     // 1. multiple threads can read different sessions concurrently
     // 2. multiple threads can modify different sessions concurrently
     // 3. the outer write lock is only needed for adding/removing sessions
-    let udp_session_map = Arc::new(DashMap::new());
+    let udp_session_map = Arc::new(UdpState::new());
 
     // Clone what we need for each loop before creating async blocks
     let heartbeat_connection = connection.clone();
@@ -191,8 +202,8 @@ async fn run_heartbeat_loop(
 
 async fn auth_connection(
     connection: &quinn::Connection,
-    uuid: &'static [u8],
-    password: &'static str,
+    uuid: &[u8],
+    password: &str,
 ) -> std::io::Result<()> {
     let mut expected_token_bytes = [0u8; 32];
     connection
@@ -224,18 +235,13 @@ async fn auth_connection(
             continue;
         }
 
-        let specified_uuid = stream_reader.read_slice(&mut recv_stream, 16).await?;
-        if specified_uuid != uuid {
+        let credentials = stream_reader.read_slice(&mut recv_stream, 48).await?;
+        let authenticated =
+            credentials[..16].ct_eq(uuid) & credentials[16..].ct_eq(&expected_token_bytes);
+        if !bool::from(authenticated) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("incorrect uuid: {specified_uuid:?}"),
-            ));
-        }
-        let token_bytes = stream_reader.read_slice(&mut recv_stream, 32).await?;
-        if token_bytes != expected_token_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "incorrect token",
+                "incorrect credentials",
             ));
         }
 
@@ -248,8 +254,13 @@ async fn run_bidirectional_loop(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
 ) -> std::io::Result<()> {
+    let mut tasks = JoinSet::new();
     loop {
-        let (send_stream, recv_stream) = match connection.accept_bi().await {
+        let accepted = tokio::select! {
+            result = connection.accept_bi() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let (send_stream, recv_stream) = match accepted {
             Ok(s) => s,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -265,11 +276,27 @@ async fn run_bidirectional_loop(
         };
 
         let conn = connection.clone();
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() >= limit)
+        {
+            continue;
+        }
+        let Some(permit) = crate::resources::try_stream() else {
+            continue;
+        };
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
-        tokio::spawn(async move {
-            match process_tcp_stream(client_proxy_selector, resolver, send_stream, recv_stream)
-                .await
+        tasks.spawn(async move {
+            let _permit = permit;
+            match process_tcp_stream(
+                client_proxy_selector,
+                resolver,
+                send_stream,
+                recv_stream,
+                conn.remote_address(),
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
@@ -366,31 +393,12 @@ fn serialize_address(location: &NetLocation) -> Vec<u8> {
     address_bytes
 }
 
-fn serialize_socket_addr(addr: &SocketAddr) -> Vec<u8> {
-    let mut res = match addr {
-        SocketAddr::V4(addr_v4) => {
-            let mut res = Vec::with_capacity(1 + 4 + 2);
-            res.push(0x01); // address type for IPv4
-            res.extend_from_slice(&addr_v4.ip().octets());
-            res
-        }
-        SocketAddr::V6(addr_v6) => {
-            let mut res = Vec::with_capacity(1 + 16 + 2);
-            res.push(0x02); // address type for IPv6
-            res.extend_from_slice(&addr_v6.ip().octets());
-            res
-        }
-    };
-
-    res.extend_from_slice(&addr.port().to_be_bytes());
-    res
-}
-
 async fn process_tcp_stream(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let mut stream_reader = StreamReader::new_with_buffer_size(1024);
     let tuic_version = stream_reader.read_u8(&mut recv).await?;
@@ -412,123 +420,159 @@ async fn process_tcp_stream(
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty address"))?;
 
-    let mut server_stream: Box<dyn AsyncStream> = Box::new(QuicStream::from(send, recv));
-    let setup_client_stream_future = timeout(
-        Duration::from_secs(60),
-        setup_client_tcp_stream(
-            &mut server_stream,
-            client_proxy_selector,
-            resolver,
-            remote_location.clone(),
-        ),
-    );
+    relay_tcp_stream(
+        Box::new(QuicStream::from(send, recv).with_peer(peer)),
+        remote_location,
+        stream_reader.into_unparsed_data(),
+        client_proxy_selector,
+        resolver,
+    )
+    .await
+}
 
-    let mut client_stream = match setup_client_stream_future.await {
-        Ok(Ok(Some(s))) => s,
-        Ok(Ok(None)) => {
-            // Must have been blocked.
-            let _ = server_stream.shutdown().await;
-            return Ok(());
+async fn relay_tcp_stream(
+    mut server_stream: Box<dyn AsyncStream>,
+    remote_location: NetLocation,
+    initial_data: Vec<u8>,
+    client_proxy_selector: Arc<ClientProxySelector>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<()> {
+    let setup_client_stream_future = async {
+        let route = timeout(Duration::from_secs(60), async {
+            let prepared = PreparedTcp::new(
+                &client_proxy_selector,
+                remote_location.clone(),
+                initial_data,
+            )?
+            .with_source(server_stream.peer_addr());
+            prepared
+                .route(&mut server_stream, &client_proxy_selector, &resolver)
+                .await
+        })
+        .await?;
+        match route {
+            Ok(route) => timeout(Duration::from_secs(60), route.connect(&resolver)).await,
+            Err(error) => Ok(Err(error)),
         }
+    };
+
+    let routed = match setup_client_stream_future.await {
+        Ok(Ok(routed)) => routed,
         Ok(Err(e)) => {
-            let _ = server_stream.shutdown().await;
+            crate::util::shutdown_stream(&mut server_stream).await;
             return Err(std::io::Error::new(
                 e.kind(),
                 format!("failed to setup client stream to {remote_location}: {e}"),
             ));
         }
         Err(elapsed) => {
-            let _ = server_stream.shutdown().await;
+            crate::util::shutdown_stream(&mut server_stream).await;
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("client setup to {remote_location} timed out: {elapsed}"),
             ));
         }
     };
-
-    let unparsed_data = stream_reader.unparsed_data();
-    let client_requires_flush = if unparsed_data.is_empty() {
-        false
-    } else {
-        write_all(&mut client_stream, unparsed_data).await?;
-        true
+    let Some(crate::tcp::tcp_handler::TcpClientSetupResult {
+        mut client_stream,
+        early_data,
+    }) = routed.setup
+    else {
+        crate::util::shutdown_stream(&mut server_stream).await;
+        return Ok(());
     };
-    drop(stream_reader);
+
+    let flow = client_stream.flow().cloned();
+    crate::control::tracked_stream::during_flow(
+        flow.as_deref(),
+        crate::util::timeout_stream_setup(async {
+            if let Some(data) = early_data {
+                write_all(&mut server_stream, &data).await?;
+                server_stream.flush().await?;
+            }
+            if !routed.prefix.is_empty() {
+                write_all(&mut client_stream, &routed.prefix).await?;
+                client_stream.flush().await?;
+            }
+            Ok(())
+        }),
+    )
+    .await?;
+    drop(routed.prefix);
 
     // Use 32KB buffers to match reference implementations
     let copy_result = copy_bidirectional_with_sizes(
         &mut server_stream,
         &mut client_stream,
         false, // no need to flush since it's QUIC
-        client_requires_flush,
+        false,
         32768,
         32768,
     )
     .await;
 
-    let (_, _) = futures::join!(server_stream.shutdown(), client_stream.shutdown());
+    crate::util::shutdown_stream_pair(&mut server_stream, &mut client_stream).await;
 
     copy_result?;
     Ok(())
 }
 
 struct UdpSession {
-    send_socket: Arc<UdpSocket>,
-    // we cache the last location in case of mid-session address changes, and
-    // don't want to have to call ClientProxySelector::judge on every packet.
-    last_location: NetLocation,
-    last_socket_addr: SocketAddr,
-    override_remote_write_address: Option<SocketAddr>,
-    last_activity: std::time::Instant,
+    send_socket: Arc<UdpRelay>,
+    pinned_location: Option<NetLocation>,
     // Cancellation token for this session's background task
     cancel_token: CancellationToken,
+    task: Option<tokio::task::AbortHandle>,
+    _permit: Option<crate::resources::BudgetPermit>,
 }
 
-struct FragmentedPacket {
-    fragment_count: u8,
-    fragment_received: u8,
-    packet_len: usize,
-    received: Vec<Option<Bytes>>,
-    remote_location: Option<NetLocation>,
+impl Drop for UdpSession {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 impl UdpSession {
     #[allow(clippy::too_many_arguments)]
     fn start_with_send_stream(
         assoc_id: u16,
-        send_stream: quinn::SendStream,
-        client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
+        connection: quinn::Connection,
+        client_socket: Arc<UdpRelay>,
         override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
+        permit: crate::resources::BudgetPermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let session = UdpSession {
+        let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
-            last_activity: std::time::Instant::now(),
+            pinned_location,
             cancel_token: session_cancel_token.clone(),
+            task: None,
+            _permit: Some(permit),
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_stream_loop(
-                assoc_id,
-                send_stream,
-                client_socket,
-                override_local_write_location,
-                session_cancel_token,
-            )
-            .await
-            {
-                error!("UDP remote-to-local write loop ended with error: {e}");
-            }
-        });
+        session.task = Some(
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_remote_to_local_stream_loop(
+                    assoc_id,
+                    connection,
+                    client_socket,
+                    override_local_write_location,
+                    session_cancel_token,
+                )
+                .await
+                {
+                    error!("UDP remote-to-local write loop ended with error: {e}");
+                }
+            })
+            .abort_handle(),
+        );
 
         session
     }
@@ -537,97 +581,48 @@ impl UdpSession {
     fn start_with_datagram(
         assoc_id: u16,
         connection: quinn::Connection,
-        client_socket: Arc<UdpSocket>,
-        initial_location: NetLocation,
-        initial_socket_addr: SocketAddr,
+        client_socket: Arc<UdpRelay>,
         override_local_write_location: Option<NetLocation>,
-        override_remote_write_address: Option<SocketAddr>,
+        pinned_location: Option<NetLocation>,
         parent_cancel_token: &CancellationToken,
+        permit: crate::resources::BudgetPermit,
     ) -> Self {
         // Create a child token so this session is cancelled when the parent (connection) is cancelled
         let session_cancel_token = parent_cancel_token.child_token();
 
-        let session = UdpSession {
+        let mut session = UdpSession {
             send_socket: client_socket.clone(),
-            last_location: initial_location,
-            last_socket_addr: initial_socket_addr,
-            override_remote_write_address,
-            last_activity: std::time::Instant::now(),
+            pinned_location,
             cancel_token: session_cancel_token.clone(),
+            task: None,
+            _permit: Some(permit),
         };
 
-        tokio::spawn(async move {
-            if let Err(e) = run_udp_remote_to_local_datagram_loop(
-                assoc_id,
-                connection,
-                client_socket,
-                override_local_write_location,
-                session_cancel_token,
-            )
-            .await
-            {
-                error!("UDP remote-to-local write loop ended with error: {e}");
-            }
-        });
+        session.task = Some(
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_remote_to_local_datagram_loop(
+                    assoc_id,
+                    connection,
+                    client_socket,
+                    override_local_write_location,
+                    session_cancel_token,
+                )
+                .await
+                {
+                    error!("UDP remote-to-local write loop ended with error: {e}");
+                }
+            })
+            .abort_handle(),
+        );
 
         session
-    }
-
-    #[inline]
-    async fn resolve_address(
-        &self,
-        location: &NetLocation,
-        client_proxy_selector: &Arc<ClientProxySelector>,
-        resolver: &Arc<dyn Resolver>,
-    ) -> std::io::Result<(SocketAddr, bool)> {
-        let (addr, is_updated) = match self.override_remote_write_address {
-            Some(addr) => (addr, false),
-            None => {
-                if location == &self.last_location {
-                    (self.last_socket_addr, false)
-                } else {
-                    let action = client_proxy_selector
-                        .judge(location.clone().into(), resolver)
-                        .await?;
-
-                    let updated_location = match action {
-                        ConnectDecision::Allow {
-                            chain_group: _,
-                            remote_location,
-                        } => remote_location,
-                        ConnectDecision::Block => {
-                            return Err(std::io::Error::other(format!(
-                                "Blocked UDP forward to {location}"
-                            )));
-                        }
-                    };
-                    let updated_address =
-                        match resolve_single_address(resolver, updated_location.location()).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!("Failed to resolve updated remote location {location}: {e}");
-                                return Err(e);
-                            }
-                        };
-
-                    (updated_address, true)
-                }
-            }
-        };
-
-        Ok((addr, is_updated))
-    }
-
-    fn update_last_location(&mut self, location: NetLocation, socket_addr: SocketAddr) {
-        self.last_location = location;
-        self.last_socket_addr = socket_addr;
     }
 }
 
 async fn run_udp_remote_to_local_stream_loop(
     assoc_id: u16,
-    mut send_stream: quinn::SendStream,
-    socket: Arc<UdpSocket>,
+    connection: quinn::Connection,
+    socket: Arc<UdpRelay>,
     override_local_write_address: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
@@ -635,30 +630,14 @@ async fn run_udp_remote_to_local_stream_loop(
         override_local_write_address.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(MAX_HEADER_LEN + 65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = match socket.try_recv_from(&mut buf[MAX_HEADER_LEN..]) {
-            Ok(res) => res,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Use select! to allow cancellation while waiting for socket to be readable
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        return Ok(());
-                    }
-                    result = socket.readable() => {
-                        result?;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {e}"
-                )));
-            }
+        let (payload, src_addr) = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = socket.recv() => result?,
         };
+        let payload_len = payload.len();
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         loop_count = loop_count.wrapping_add(1);
@@ -671,42 +650,27 @@ async fn run_udp_remote_to_local_stream_loop(
 
         let address_bytes = match original_address_bytes {
             Some(ref a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
 
-        let address_bytes_len = address_bytes.len();
-
-        // assoc_id(2) + packet_id(2) + fragment total(1) + fragment id(1) + payload size (2) + address bytes
-        let header_len = 2 + 2 + 1 + 1 + 2 + address_bytes_len;
-
-        let start_offset = MAX_HEADER_LEN - header_len;
-        let end_offset = MAX_HEADER_LEN + payload_len;
-
-        buf[start_offset] = (assoc_id >> 8) as u8;
-        buf[start_offset + 1] = assoc_id as u8;
-        buf[start_offset + 2] = (packet_id >> 8) as u8;
-        buf[start_offset + 3] = packet_id as u8;
-        buf[start_offset + 4] = 1;
-        buf[start_offset + 5] = 0;
-        buf[start_offset + 6] = (payload_len >> 8) as u8;
-        buf[start_offset + 7] = payload_len as u8;
-        buf[start_offset + 8..start_offset + 8 + address_bytes_len].copy_from_slice(&address_bytes);
-
-        let mut i = start_offset;
-        while i < end_offset {
-            let count = send_stream
-                .write(&buf[i..end_offset])
-                .await
-                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
-            i += count;
-        }
+        let mut frame = BytesMut::with_capacity(MAX_HEADER_LEN + payload_len);
+        frame.extend_from_slice(&[5, COMMAND_TYPE_PACKET]);
+        frame.extend_from_slice(&assoc_id.to_be_bytes());
+        frame.extend_from_slice(&packet_id.to_be_bytes());
+        frame.extend_from_slice(&[1, 0]);
+        frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        frame.extend_from_slice(&address_bytes);
+        frame.extend_from_slice(&payload);
+        let mut send_stream = connection.open_uni().await?;
+        write_all(&mut send_stream, &frame).await?;
+        send_stream.finish()?;
     }
 }
 
 async fn run_udp_remote_to_local_datagram_loop(
     assoc_id: u16,
     connection: quinn::Connection,
-    client_socket: Arc<UdpSocket>,
+    client_socket: Arc<UdpRelay>,
     override_local_write_location: Option<NetLocation>,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
@@ -720,30 +684,14 @@ async fn run_udp_remote_to_local_datagram_loop(
         override_local_write_location.map(|a| serialize_address(&a).into());
 
     let mut next_packet_id: u16 = 0;
-    let mut buf = allocate_vec(65535).into_boxed_slice();
     let mut loop_count: u8 = 0;
 
     loop {
-        let (payload_len, src_addr) = match client_socket.try_recv_from(&mut buf) {
-            Ok(res) => res,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Use select! to allow cancellation while waiting for socket to be readable
-                tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        return Ok(());
-                    }
-                    result = client_socket.readable() => {
-                        result?;
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(std::io::Error::other(format!(
-                    "failed to receive from UDP socket: {e}"
-                )));
-            }
+        let (payload, src_addr) = tokio::select! {
+            _ = cancel_token.cancelled() => return Ok(()),
+            result = client_socket.recv() => result?,
         };
+        let payload_len = payload.len();
 
         // Yield periodically to allow quinn's internal tasks to run (keepalives, ACKs, etc.)
         loop_count = loop_count.wrapping_add(1);
@@ -756,7 +704,7 @@ async fn run_udp_remote_to_local_datagram_loop(
 
         let address_bytes: Bytes = match &original_address_bytes {
             Some(a) => a.clone(),
-            None => serialize_socket_addr(&src_addr).into(),
+            None => serialize_address(&src_addr).into(),
         };
         let address_bytes_len = address_bytes.len();
 
@@ -777,7 +725,7 @@ async fn run_udp_remote_to_local_datagram_loop(
             datagram.put_u8(0); // frag_id = 0
             datagram.extend_from_slice(&(payload_len as u16).to_be_bytes());
             datagram.extend_from_slice(&address_bytes);
-            datagram.extend_from_slice(&buf[..payload_len]);
+            datagram.extend_from_slice(&payload);
 
             connection
                 .send_datagram(datagram.freeze())
@@ -786,12 +734,20 @@ async fn run_udp_remote_to_local_datagram_loop(
             // Calculate header sizes for first fragment and subsequent fragments.
             let first_overhead = header_overhead; // full address included in the first fragment
             let other_overhead = 1 + 1 + 2 + 2 + 1 + 1 + 2 + 1; // 0xff marker instead of full address
+            if max_datagram_size <= first_overhead || max_datagram_size <= other_overhead {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "QUIC datagram cannot fit UDP header",
+                ));
+            }
             let first_capacity = max_datagram_size - first_overhead;
             let other_capacity = max_datagram_size - other_overhead;
 
             let remaining = payload_len.saturating_sub(first_capacity);
             let additional_fragments = remaining.div_ceil(other_capacity);
-            let fragment_count = 1 + additional_fragments;
+            let fragment_count = u8::try_from(1 + additional_fragments).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "too many UDP fragments")
+            })? as usize;
 
             let mut offset = 0;
             for fragment_id in 0..fragment_count {
@@ -814,7 +770,7 @@ async fn run_udp_remote_to_local_datagram_loop(
                 } else {
                     datagram.put_u8(0xff);
                 }
-                datagram.extend_from_slice(&buf[offset..offset + fragment_payload_len]);
+                datagram.extend_from_slice(&payload[offset..offset + fragment_payload_len]);
                 connection.send_datagram(datagram.freeze()).map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to send datagram fragment {fragment_id}: {e}"
@@ -832,19 +788,21 @@ async fn run_unidirectional_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
+    let mut tasks = JoinSet::new();
     // Spawn a cleanup task for UDP sessions that terminates when connection closes
     let cleanup_session_map = udp_session_map.clone();
     let cleanup_cancel_token = cancel_token.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 _ = cleanup_cancel_token.cancelled() => {
                     break;
                 }
                 _ = interval.tick() => {
-                    cleanup_session_map.retain(|assoc_id, session| {
-                        if session.last_activity.elapsed() > IDLE_TIMEOUT {
+                    cleanup_session_map.fragments.lock().expire();
+                    cleanup_session_map.sessions.retain(|assoc_id, session| {
+                        if session.send_socket.idle_for() > IDLE_TIMEOUT {
                             // Cancel the session's background task before removing
                             session.cancel_token.cancel();
                             debug!("Removing inactive UDP session {assoc_id}");
@@ -859,7 +817,11 @@ async fn run_unidirectional_loop(
     });
 
     loop {
-        let recv_stream = match connection.accept_uni().await {
+        let accepted = tokio::select! {
+            result = connection.accept_uni() => result,
+            _ = tasks.join_next(), if !tasks.is_empty() => continue,
+        };
+        let recv_stream = match accepted {
             Ok(recv_stream) => recv_stream,
             Err(quinn::ConnectionError::ApplicationClosed(_)) => {
                 break;
@@ -874,24 +836,42 @@ async fn run_unidirectional_loop(
             }
         };
 
+        if crate::resources::limits()
+            .max_streams_per_connection
+            .is_some_and(|limit| tasks.len() > limit)
+        {
+            continue;
+        }
+        let Some(permit) = crate::resources::try_stream() else {
+            continue;
+        };
         let connection = connection.clone();
         let client_proxy_selector = client_proxy_selector.clone();
         let resolver = resolver.clone();
         let udp_session_map = udp_session_map.clone();
         let cancel_token = cancel_token.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
+            let _permit = permit;
             // Per TUIC protocol, each uni stream carries exactly ONE command.
             // The reference implementation (handle_stream.rs) handles one task per stream.
-            match process_uni_stream(
-                &connection,
-                client_proxy_selector,
-                resolver,
-                recv_stream,
-                udp_session_map,
-                cancel_token,
+            match timeout(
+                Duration::from_secs(30),
+                process_uni_stream(
+                    &connection,
+                    client_proxy_selector,
+                    resolver,
+                    recv_stream,
+                    udp_session_map,
+                    cancel_token,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TUIC command timed out",
+                ))
+            }) {
                 Ok(()) => {}
                 Err(e) => {
                     // Per official TUIC reference (handle_stream.rs:70-78),
@@ -929,7 +909,7 @@ async fn process_uni_stream(
         let assoc_id = stream_reader.read_u16_be(&mut recv_stream).await?;
         // Remove and cancel the session's background task.
         // Per official TUIC Rust reference (handle_task.rs:154-165).
-        if let Some((_, session)) = udp_session_map.remove(&assoc_id) {
+        if let Some((_, session)) = udp_session_map.sessions.remove(&assoc_id) {
             session.cancel_token.cancel();
         }
         // Session not found is normal - it may have already timed out or been closed
@@ -954,21 +934,11 @@ async fn process_uni_stream(
         .read_slice(&mut recv_stream, payload_size as usize)
         .await?;
 
-    // For uni stream packets, we need per-connection fragment reassembly.
-    // Since each stream is one packet, fragments come on separate streams.
-    // We use the connection-level udp_session_map for this.
-    // Note: Fragment reassembly for uni streams is handled at the session level.
-    // For simplicity, we only support non-fragmented packets on uni streams for now,
-    // or let process_udp_packet handle it with a temporary fragment cache.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
-
     process_udp_packet(
         connection,
         &client_proxy_selector,
         &resolver,
         &udp_session_map,
-        &mut fragments,
         assoc_id,
         packet_id,
         frag_total,
@@ -989,7 +959,6 @@ async fn process_udp_packet(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     udp_session_map: &UdpSessionMap,
-    fragments: &mut LruCache<u16, FragmentedPacket>,
     assoc_id: u16,
     packet_id: u16,
     frag_total: u8,
@@ -999,253 +968,219 @@ async fn process_udp_packet(
     is_uni_stream: bool,
     cancel_token: &CancellationToken,
 ) -> std::io::Result<()> {
-    if frag_total == 0 {
-        return Err(std::io::Error::other(
-            "Ignoring packet with empty fragment total",
-        ));
+    let Some((remote_location, payload)) = udp_session_map.fragments.lock().push(
+        (assoc_id, packet_id),
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    )?
+    else {
+        return Ok(());
+    };
+    if crate::resources::limits()
+        .max_udp_destinations
+        .is_some_and(|limit| udp_session_map.sessions.len() >= limit)
+        && !udp_session_map.sessions.contains_key(&assoc_id)
+    {
+        return Ok(());
     }
 
-    // Bounds check: frag_id must be less than frag_total to avoid panic
-    // Per sing-box reference (packet.go:394)
-    if frag_id >= frag_total {
-        return Err(std::io::Error::other(format!(
-            "Invalid fragment id {frag_id} >= total {frag_total}"
-        )));
-    }
-
+    let existing = udp_session_map
+        .sessions
+        .get(&assoc_id)
+        .map(|entry| Arc::clone(entry.value()));
     let session = {
-        match udp_session_map.get(&assoc_id) {
+        match existing {
             Some(s) => s,
             None => {
-                // TODO: it's possible that a new session starts with a fragmented packet, and we
-                // receive this initial packet out of order so there's no address.
-                if remote_location.is_none() {
-                    return Err(std::io::Error::other(
-                        "Ignoring packet with unknown session and empty address",
-                    ));
-                }
+                let permit = udp_session_map.slots.acquire(1).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "TUIC UDP session limit reached",
+                    )
+                })?;
+                let pinned_location = if client_proxy_selector.fake_dns_enabled() {
+                    // The shared router prepares and routes each destination once.
+                    None
+                } else {
+                    let action = client_proxy_selector
+                        .judge(remote_location.clone().into(), resolver)
+                        .await;
 
-                let remote_location = remote_location.clone().unwrap();
-
-                let action = client_proxy_selector
-                    .judge(remote_location.clone().into(), resolver)
-                    .await;
-
-                let (_chain_group, updated_location) = match action {
-                    Ok(ConnectDecision::Allow {
-                        chain_group,
-                        remote_location,
-                    }) => (chain_group, remote_location),
-                    Ok(ConnectDecision::Block) => {
-                        return Err(std::io::Error::other(format!(
-                            "Blocked UDP forward to {remote_location}"
-                        )));
-                    }
-                    Err(e) => {
-                        return Err(std::io::Error::other(format!(
-                            "Failed to judge UDP forward to {remote_location}: {e}"
-                        )));
-                    }
-                };
-
-                let resolved_address =
-                    resolve_single_address(resolver, updated_location.location())
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::other(format!(
-                                "Failed to resolve initial remote location {}: {e}",
-                                updated_location.location()
-                            ))
-                        })?;
-
-                let (override_remote_write_address, override_local_write_location) =
-                    if resolved_address.to_string() != remote_location.to_string() {
-                        (Some(resolved_address), Some(remote_location.clone()))
-                    } else {
-                        // since we don't replace addresses, support the case where a future
-                        // address is ipv6
-                        (None, None)
+                    let (_chain_group, updated_location) = match action {
+                        Ok(ConnectDecision::Allow {
+                            chain_group,
+                            remote_location,
+                        }) => (chain_group, remote_location),
+                        Ok(ConnectDecision::Block) => {
+                            return Err(std::io::Error::other(format!(
+                                "Blocked UDP forward to {remote_location}"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(std::io::Error::other(format!(
+                                "Failed to judge UDP forward to {remote_location}: {e}"
+                            )));
+                        }
                     };
 
-                // Use IPv6 dual-stack socket for direct UDP
-                let client_socket = crate::socket_util::new_udp_socket(true, None)?;
+                    if remote_location.address().hostname().is_some()
+                        || updated_location.location() != &remote_location
+                    {
+                        Some(remote_location.clone())
+                    } else {
+                        None
+                    }
+                };
+                let client_socket = UdpRelay::new(
+                    client_proxy_selector.clone(),
+                    resolver.clone(),
+                    Some(connection.remote_address()),
+                )?;
 
                 let session = if is_uni_stream {
-                    // TODO: should we only have a single send stream?
-                    let send_stream = connection.open_uni().await?;
-
                     UdpSession::start_with_send_stream(
                         assoc_id,
-                        send_stream,
+                        connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
-                        resolved_address,
-                        override_local_write_location,
-                        override_remote_write_address,
+                        pinned_location.clone(),
+                        pinned_location,
                         cancel_token,
+                        permit,
                     )
                 } else {
                     UdpSession::start_with_datagram(
                         assoc_id,
                         connection.clone(),
                         Arc::new(client_socket),
-                        remote_location,
-                        resolved_address,
-                        override_local_write_location,
-                        override_remote_write_address,
+                        pinned_location.clone(),
+                        pinned_location,
                         cancel_token,
+                        permit,
                     )
                 };
 
                 // it's possible that the session is already on the map since we last checked.
                 // TODO: why is there no way to get a Ref<_> from an Entry<_>? see if we can
                 // do better than converting into a RefMut<_> and then downgrading.
-                match udp_session_map.entry(assoc_id) {
-                    dashmap::mapref::entry::Entry::Occupied(entry) => entry.into_ref().downgrade(),
+                match udp_session_map.sessions.entry(assoc_id) {
+                    dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
                     dashmap::mapref::entry::Entry::Vacant(entry) => {
-                        entry.insert_entry(session).into_ref().downgrade()
+                        let session = Arc::new(session);
+                        entry.insert(session.clone());
+                        session
                     }
                 }
             }
         }
     };
 
-    if frag_total == 1 {
-        if remote_location.is_none() {
-            return Err(std::io::Error::other(
-                "Ignoring packet with single fragment and no address",
-            ));
-        }
-        let remote_location = remote_location.as_ref().unwrap();
+    let target = session.pinned_location.clone().unwrap_or(remote_location);
+    if let Err(e) = session.send_socket.send_to(payload, target) {
+        error!("Failed to forward UDP payload for session {assoc_id}: {e}");
+        udp_session_map
+            .sessions
+            .remove_if(&assoc_id, |_, current| Arc::ptr_eq(current, &session));
+    }
+    Ok(())
+}
 
-        let (socket_addr, is_updated) = session
-            .resolve_address(remote_location, client_proxy_selector, resolver)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
+struct UdpPacket<'a> {
+    assoc_id: u16,
+    packet_id: u16,
+    frag_total: u8,
+    frag_id: u8,
+    remote_location: Option<NetLocation>,
+    payload_fragment: &'a [u8],
+}
 
-        if let Err(e) = session
-            .send_socket
-            .send_to(payload_fragment, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
-
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
-        }
-    } else {
-        let is_new = !fragments.contains(&packet_id);
-
-        if is_new {
-            // Insert new fragmented packet entry
-            fragments.put(
-                packet_id,
-                FragmentedPacket {
-                    fragment_count: frag_total,
-                    fragment_received: 0,
-                    packet_len: 0,
-                    received: vec![None; frag_total as usize],
-                    remote_location: remote_location.clone(),
-                },
-            );
-        }
-
-        let packet = match fragments.get_mut(&packet_id) {
-            Some(p) => p,
-            None => {
-                // This shouldn't happen since we just inserted it
-                return Err(std::io::Error::other("Fragment cache error"));
-            }
-        };
-
-        if is_new && frag_id == 0 && packet.remote_location.is_none() {
-            if remote_location.is_none() {
-                fragments.pop(&packet_id);
-                return Err(std::io::Error::other(format!(
-                    "Ignoring packet with empty first fragment address for session {assoc_id}"
-                )));
-            }
-            packet.remote_location = remote_location.clone();
-        }
-
-        if packet.fragment_count != frag_total {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Mismatched fragment count for session {assoc_id} packet {packet_id}"
-            )));
-        }
-        if packet.received[frag_id as usize].is_some() {
-            fragments.pop(&packet_id);
-            return Err(std::io::Error::other(format!(
-                "Duplicate fragment for session {assoc_id} packet {packet_id}"
-            )));
-        }
-
-        packet.fragment_received += 1;
-        packet.packet_len += payload_fragment.len();
-        packet.received[frag_id as usize] = Some(payload_fragment.to_vec().into());
-
-        if packet.fragment_received != packet.fragment_count {
-            return Ok(());
-        }
-
-        // All fragments received - remove from cache and process
-        let FragmentedPacket {
-            remote_location,
-            received,
-            packet_len,
-            ..
-        } = fragments.pop(&packet_id).unwrap();
-
-        let remote_location = remote_location.unwrap();
-
-        let (socket_addr, is_updated) = session
-            .resolve_address(&remote_location, client_proxy_selector, resolver)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "Failed to resolve remote location {remote_location}: {e}"
-                ))
-            })?;
-
-        let mut complete_payload = Vec::with_capacity(packet_len);
-        for frag in received.iter() {
-            complete_payload.extend_from_slice(frag.as_ref().unwrap());
-        }
-
-        if let Err(e) = session
-            .send_socket
-            .send_to(&complete_payload, socket_addr)
-            .await
-        {
-            error!("Failed to forward UDP payload for session {assoc_id}: {e}");
-            drop(session);
-            udp_session_map.remove(&assoc_id);
-            return Ok(());
-        }
-
-        drop(session);
-        if let Some(mut session) = udp_session_map.get_mut(&assoc_id) {
-            session.last_activity = std::time::Instant::now();
-            if is_updated {
-                session.update_last_location(remote_location.clone(), socket_addr);
-            }
-        }
+fn parse_udp_packet(data: &[u8]) -> std::io::Result<UdpPacket<'_>> {
+    let data_len = data.len();
+    if data_len < 11 {
+        return Err(std::io::Error::other("decode UDP message: too short"));
     }
 
-    Ok(())
+    let assoc_id = u16::from_be_bytes([data[2], data[3]]);
+    let packet_id = u16::from_be_bytes([data[4], data[5]]);
+    let frag_total = data[6];
+    let frag_id = data[7];
+    let payload_size = u16::from_be_bytes([data[8], data[9]]) as usize;
+
+    let address_type = data[10];
+
+    let (remote_location, offset) = match address_type {
+        0xff => (None, 11),
+        0x00 => {
+            if data_len < 14 {
+                return Err(std::io::Error::other(
+                    "decode UDP message: hostname too short",
+                ));
+            }
+            let address_len = data[11] as usize;
+            if data_len < 12 + address_len + 2 + payload_size {
+                return Err(std::io::Error::other(
+                    "decode UDP message: truncated hostname",
+                ));
+            }
+            let address_bytes = &data[12..12 + address_len];
+            let address_str = str::from_utf8(address_bytes).map_err(|e| {
+                std::io::Error::other(format!("decode UDP message: invalid UTF-8: {e}"))
+            })?;
+            // Although this is supposed to be a hostname, some clients will pass
+            // ipv4 and ipv6 addresses as well, so parse it rather than directly
+            // using Address:Hostname enum.
+            let address = Address::from(address_str).map_err(|e| {
+                std::io::Error::other(format!("decode UDP message: invalid address: {e}"))
+            })?;
+            let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
+            (Some(NetLocation::new(address, port)), 12 + address_len + 2)
+        }
+        0x01 => {
+            if data_len < 17 + payload_size {
+                return Err(std::io::Error::other("decode UDP message: IPv4 too short"));
+            }
+            let ipv4_addr = Ipv4Addr::new(data[11], data[12], data[13], data[14]);
+            let port = u16::from_be_bytes([data[15], data[16]]);
+            (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
+        }
+        0x02 => {
+            if data_len < 29 + payload_size {
+                return Err(std::io::Error::other("decode UDP message: IPv6 too short"));
+            }
+            let ipv6_bytes: [u8; 16] = data[11..27].try_into().unwrap();
+            let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
+            let port = u16::from_be_bytes([data[27], data[28]]);
+            (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
+        }
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "decode UDP message: invalid address type: {address_type}"
+            )));
+        }
+    };
+
+    if frag_total == 0 || frag_id >= frag_total {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid TUIC fragment index",
+        ));
+    }
+    let payload_fragment = data.get(offset..offset + payload_size).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "truncated TUIC UDP payload",
+        )
+    })?;
+
+    Ok(UdpPacket {
+        assoc_id,
+        packet_id,
+        frag_total,
+        frag_id,
+        remote_location,
+        payload_fragment,
+    })
 }
 
 async fn run_datagram_loop(
@@ -1255,27 +1190,7 @@ async fn run_datagram_loop(
     udp_session_map: UdpSessionMap,
     cancel_token: CancellationToken,
 ) -> std::io::Result<()> {
-    // Use LRU cache for fragment reassembly to prevent unbounded memory growth.
-    let mut fragments: LruCache<u16, FragmentedPacket> =
-        LruCache::new(NonZeroUsize::new(MAX_FRAGMENT_CACHE_SIZE).unwrap());
-    let mut last_cleanup = std::time::Instant::now();
-
     loop {
-        let now = std::time::Instant::now();
-        if (now - last_cleanup) > CLEANUP_INTERVAL {
-            udp_session_map.retain(|assoc_id, session| {
-                if session.last_activity.elapsed() > IDLE_TIMEOUT {
-                    // Cancel the session's background task before removing
-                    session.cancel_token.cancel();
-                    debug!("Removing inactive UDP session {assoc_id}");
-                    false
-                } else {
-                    true
-                }
-            });
-            last_cleanup = now;
-        }
-
         let data = connection
             .read_datagram()
             .await
@@ -1302,78 +1217,20 @@ async fn run_datagram_loop(
             )));
         }
 
-        let data_len = data.len();
-        if data_len < 11 {
-            return Err(std::io::Error::other("decode UDP message: too short"));
-        }
-
-        let assoc_id = u16::from_be_bytes([data[2], data[3]]);
-        let packet_id = u16::from_be_bytes([data[4], data[5]]);
-        let frag_total = data[6];
-        let frag_id = data[7];
-        let payload_size = u16::from_be_bytes([data[8], data[9]]) as usize;
-
-        let address_type = data[10];
-
-        let (remote_location, offset) = match address_type {
-            0xff => (None, 11),
-            0x00 => {
-                if data_len < 14 {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: hostname too short",
-                    ));
-                }
-                let address_len = data[11] as usize;
-                if data_len < 12 + address_len + 2 + payload_size {
-                    return Err(std::io::Error::other(
-                        "decode UDP message: truncated hostname",
-                    ));
-                }
-                let address_bytes = &data[12..12 + address_len];
-                let address_str = str::from_utf8(address_bytes).map_err(|e| {
-                    std::io::Error::other(format!("decode UDP message: invalid UTF-8: {e}"))
-                })?;
-                // Although this is supposed to be a hostname, some clients will pass
-                // ipv4 and ipv6 addresses as well, so parse it rather than directly
-                // using Address:Hostname enum.
-                let address = Address::from(address_str).map_err(|e| {
-                    std::io::Error::other(format!("decode UDP message: invalid address: {e}"))
-                })?;
-                let port = u16::from_be_bytes([data[12 + address_len], data[12 + address_len + 1]]);
-                (Some(NetLocation::new(address, port)), 12 + address_len + 2)
-            }
-            0x01 => {
-                if data_len < 17 + payload_size {
-                    return Err(std::io::Error::other("decode UDP message: IPv4 too short"));
-                }
-                let ipv4_addr = Ipv4Addr::new(data[11], data[12], data[13], data[14]);
-                let port = u16::from_be_bytes([data[15], data[16]]);
-                (Some(NetLocation::new(Address::Ipv4(ipv4_addr), port)), 17)
-            }
-            0x02 => {
-                if data_len < 29 + payload_size {
-                    return Err(std::io::Error::other("decode UDP message: IPv6 too short"));
-                }
-                let ipv6_bytes: [u8; 16] = data[11..27].try_into().unwrap();
-                let ipv6_addr = Ipv6Addr::from(ipv6_bytes);
-                let port = u16::from_be_bytes([data[27], data[28]]);
-                (Some(NetLocation::new(Address::Ipv6(ipv6_addr), port)), 29)
-            }
-            _ => {
-                return Err(std::io::Error::other(format!(
-                    "decode UDP message: invalid address type: {address_type}"
-                )));
-            }
-        };
-
-        let payload_fragment = &data[offset..offset + payload_size];
+        let UdpPacket {
+            assoc_id,
+            packet_id,
+            frag_total,
+            frag_id,
+            remote_location,
+            payload_fragment,
+        } = parse_udp_packet(&data)?;
 
         if let Err(e) = process_udp_packet(
             &connection,
             &client_proxy_selector,
             &resolver,
             &udp_session_map,
-            &mut fragments,
             assoc_id,
             packet_id,
             frag_total,
@@ -1393,65 +1250,69 @@ async fn run_datagram_loop(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_tuic_server(
     bind_address: SocketAddr,
-    quic_server_config: Arc<quinn::crypto::rustls::QuicServerConfig>,
-    uuid: &'static [u8],
-    password: &'static str,
+    quic_server_config: Arc<dyn quinn::crypto::ServerConfig>,
+    uuid: Arc<[u8]>,
+    password: Arc<str>,
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
-    for _ in 0..num_endpoints {
-        let quic_server_config = quic_server_config.clone();
+    let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+
+    let memory_bytes = crate::resources::configure_quic(&mut server_config, 4096, 4096);
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
+        .keep_alive_interval(Some(Duration::from_secs(15)))
+        // MTU settings per official TUIC reference
+        .initial_mtu(1200)
+        .min_mtu(1200)
+        // Enable MTU discovery for larger packets on capable networks
+        .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
+        // Enable GSO (Generic Segmentation Offload) for better throughput
+        .enable_segmentation_offload(true)
+        // Lower initial RTT estimate for faster initial window growth
+        .initial_rtt(Duration::from_millis(100));
+
+    for endpoint in crate::listener_tasks::QuicListener::bind_all(
+        bind_address,
+        server_config,
+        num_endpoints,
+        memory_bytes,
+    )? {
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
-
+        let uuid = uuid.clone();
+        let password = password.clone();
         let join_handle = tokio::spawn(async move {
-            let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
-
-            Arc::get_mut(&mut server_config.transport)
-                .unwrap()
-                .max_concurrent_bidi_streams(4096_u32.into())
-                .max_concurrent_uni_streams(4096_u32.into())
-                .max_idle_timeout(Some(Duration::from_secs(60).try_into().unwrap()))
-                .keep_alive_interval(Some(Duration::from_secs(15)))
-                .send_window(16 * 1024 * 1024)
-                .receive_window((20u32 * 1024 * 1024).into())
-                .stream_receive_window((8u32 * 1024 * 1024).into())
-                // MTU settings per official TUIC reference
-                .initial_mtu(1200)
-                .min_mtu(1200)
-                // Enable MTU discovery for larger packets on capable networks
-                .mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()))
-                // Enable GSO (Generic Segmentation Offload) for better throughput
-                .enable_segmentation_offload(true)
-                // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
-
-            // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
-            // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket_with_buffer_size(
-                bind_address.is_ipv6(),
-                None,
-                Some(bind_address),
-                true,
-                Some(8_625_000),
-            )
-            .unwrap();
-
-            let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
-                Some(server_config),
-                socket2_socket.into(),
-                Arc::new(quinn::TokioRuntime),
-            )
-            .unwrap();
-
-            while let Some(conn) = endpoint.accept().await {
+            let mut tasks = crate::listener_tasks::ListenerTasks::immediate();
+            loop {
+                let conn = tokio::select! {
+                    conn = endpoint.accept() => conn,
+                    _ = tasks.join_next(), if !tasks.is_empty() => continue,
+                };
+                let Some(conn) = conn else { break };
+                let Some(permit) =
+                    crate::resources::try_connection(Some(conn.remote_address().ip()))
+                else {
+                    conn.refuse();
+                    continue;
+                };
+                let conn = match conn.accept() {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        debug!("QUIC accept failed: {e}");
+                        continue;
+                    }
+                };
                 let cloned_selector = client_proxy_selector.clone();
                 let cloned_resolver = resolver.clone();
-                tokio::spawn(async move {
+                let uuid = uuid.clone();
+                let password = password.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = process_connection(
                         cloned_selector,
                         cloned_resolver,
@@ -1471,4 +1332,261 @@ pub async fn start_tuic_server(
     }
 
     Ok(join_handles)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fake_dns_adapter_contract() {
+        use crate::tcp::ingress::tests::FakeTcpCase;
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(10), async {
+            for case in [
+                FakeTcpCase::Dns,
+                FakeTcpCase::Tls,
+                FakeTcpCase::Http,
+                FakeTcpCase::Plain,
+                FakeTcpCase::Unknown,
+            ] {
+                let mut tasks = JoinSet::new();
+                let (selector, resolver, target, payload) = case.fixture(&mut tasks).await;
+                let split = payload.len().min(5);
+                let prefix = payload[..split].to_vec();
+                let (server, mut peer) = tokio::io::duplex(8192);
+                tasks.spawn(async move {
+                    let result =
+                        relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                            .await;
+                    assert_eq!(result.is_err(), case == FakeTcpCase::Unknown);
+                });
+                peer.write_all(&payload[split..]).await.unwrap();
+                peer.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                peer.read_to_end(&mut reply).await.unwrap();
+                if case == FakeTcpCase::Unknown {
+                    assert!(reply.is_empty());
+                } else {
+                    case.assert_reply(&reply);
+                }
+                while let Some(result) = tasks.join_next().await {
+                    result.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sniff_replays_header_tail_without_an_ack_frame() {
+        use tokio::io::AsyncReadExt;
+        timeout(Duration::from_secs(5), async {
+            let mut tasks = JoinSet::new();
+            let hello = crate::sniff::tests::hello(&rustls::version::TLS13, true);
+            let (selector, resolver) =
+                crate::tcp::ingress::tests::socks_target(hello.clone(), &mut tasks).await;
+            let target = NetLocation::from_str(crate::tcp::ingress::tests::TARGET, None).unwrap();
+            let (server, mut peer) = tokio::io::duplex(8192);
+            let prefix = hello[..5].to_vec();
+            tasks.spawn(async move {
+                relay_tcp_stream(Box::new(server), target, prefix, selector, resolver)
+                    .await
+                    .unwrap();
+            });
+            peer.write_all(&hello[5..]).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            peer.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"greetinglater");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn truncated_payload_with_absent_address_is_rejected() {
+        assert!(parse_udp_packet(&[5, 2, 0, 1, 0, 1, 2, 1, 0, 1, 0xff]).is_err());
+        let mut packet = vec![5, 2, 0, 1, 0, 1, 1, 0, 0, 3, 1, 127, 0, 0, 1, 0, 53];
+        packet.extend_from_slice(b"dns");
+        assert_eq!(parse_udp_packet(&packet).unwrap().payload_fragment, b"dns");
+        for len in 0..packet.len() {
+            assert!(parse_udp_packet(&packet[..len]).is_err());
+        }
+        for count in [0, 1, 2, 255] {
+            for id in 0..=255 {
+                packet[6] = count;
+                packet[7] = id;
+                assert_eq!(parse_udp_packet(&packet).is_ok(), count != 0 && id < count);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn map_removal_releases_reply_task() {
+        let socket = Arc::new(
+            UdpRelay::new(
+                Arc::new(ClientProxySelector::new(Vec::new())),
+                Arc::new(crate::resolver::NativeResolver::new()),
+                None,
+            )
+            .unwrap(),
+        );
+        let weak = Arc::downgrade(&socket);
+        let token = CancellationToken::new();
+        let task_socket = socket.clone();
+        let task = tokio::spawn(async move {
+            let _socket = task_socket;
+            std::future::pending::<()>().await;
+        });
+        let session = Arc::new(UdpSession {
+            send_socket: socket,
+            pinned_location: None,
+            cancel_token: token.clone(),
+            task: Some(task.abort_handle()),
+            _permit: None,
+        });
+        let map: UdpSessionMap = Arc::new(UdpState::new());
+        map.sessions.insert(1, session);
+        let snapshot = map
+            .sessions
+            .get(&1)
+            .map(|entry| entry.value().clone())
+            .unwrap();
+        map.sessions.remove(&1);
+        assert!(!token.is_cancelled());
+        drop(snapshot);
+        assert!(token.is_cancelled());
+        let _ = task.await;
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    use crate::tcp::tcp_client_handler_factory::create_test_selector;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const UUID: [u8; 16] = [0x55; 16];
+    const PASSWORD: &str = "tuic-password";
+
+    struct Peer {
+        connection: quinn::Connection,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+        _endpoints: (quinn::Endpoint, quinn::Endpoint),
+    }
+
+    async fn connect(selector: Arc<ClientProxySelector>) -> Peer {
+        let (server, client) = crate::quic_endpoint::test_endpoints();
+        let address = server.local_addr().unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let accepting = server.clone();
+        let server_task = tokio::spawn(async move {
+            let incoming = accepting.accept().await.unwrap();
+            process_connection(
+                selector,
+                resolver,
+                Arc::from(UUID.as_slice()),
+                PASSWORD.into(),
+                incoming.accept().unwrap(),
+                false,
+            )
+            .await
+        });
+        let connection = client.connect(address, "localhost").unwrap().await.unwrap();
+        Peer {
+            connection,
+            server: server_task,
+            _endpoints: (server, client),
+        }
+    }
+
+    async fn send_uni(connection: &quinn::Connection, bytes: &[u8]) {
+        let mut stream = connection.open_uni().await.unwrap();
+        stream.write_all(bytes).await.unwrap();
+        stream.finish().unwrap();
+    }
+
+    fn authenticate_command(connection: &quinn::Connection, password: &str) -> Vec<u8> {
+        let mut token = [0; 32];
+        connection
+            .export_keying_material(&mut token, &UUID, password.as_bytes())
+            .unwrap();
+        let mut command = vec![5, COMMAND_TYPE_AUTHENTICATE];
+        command.extend_from_slice(&UUID);
+        command.extend_from_slice(&token);
+        command
+    }
+
+    #[tokio::test]
+    async fn authenticated_clients_can_connect_after_earlier_commands() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = echo.local_addr().unwrap().port();
+            let echo_task = tokio::spawn(async move {
+                let (mut socket, _) = echo.accept().await.unwrap();
+                let mut request = [0; 5];
+                socket.read_exact(&mut request).await.unwrap();
+                socket.write_all(&request).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+            let peer = connect(Arc::new(
+                create_test_selector(vec![crate::config::RuleConfig::default()], resolver).unwrap(),
+            ))
+            .await;
+
+            // Commands other than AUTHENTICATE may precede authentication and are ignored.
+            send_uni(&peer.connection, &[5, COMMAND_TYPE_DISSOCIATE, 0, 1]).await;
+            send_uni(
+                &peer.connection,
+                &authenticate_command(&peer.connection, PASSWORD),
+            )
+            .await;
+
+            let (mut send, mut recv) = peer.connection.open_bi().await.unwrap();
+            let mut connect = vec![5, COMMAND_TYPE_CONNECT, 0x01, 127, 0, 0, 1];
+            connect.extend_from_slice(&port.to_be_bytes());
+            connect.extend_from_slice(b"hello");
+            send.write_all(&connect).await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(1024).await.unwrap(), b"hello");
+            echo_task.await.unwrap();
+            assert!(!peer.server.is_finished());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_authentication_closes_the_connection() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (case, version, uuid, password) in [
+                ("wrong uuid", 5, [0x66; 16], PASSWORD),
+                ("wrong password", 5, UUID, "wrong-password"),
+                ("unsupported version", 4, UUID, PASSWORD),
+            ] {
+                let peer = connect(Arc::new(ClientProxySelector::new(Vec::new()))).await;
+                // The token always binds UUID, so a wrong UUID is sent with a valid token.
+                let mut command = authenticate_command(&peer.connection, password);
+                command[0] = version;
+                command[2..18].copy_from_slice(&uuid);
+                send_uni(&peer.connection, &command).await;
+                match peer.connection.closed().await {
+                    quinn::ConnectionError::ApplicationClosed(close) => {
+                        assert_eq!(&close.reason[..], b"auth failed", "{case}");
+                    }
+                    other => panic!("{case}: unexpected close {other:?}"),
+                }
+                assert!(peer.server.await.unwrap().is_err(), "{case}");
+            }
+        })
+        .await
+        .unwrap();
+    }
 }

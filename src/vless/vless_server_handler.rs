@@ -4,12 +4,10 @@ use async_trait::async_trait;
 use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
-use crate::crypto::CryptoTlsStream;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
 use crate::stream_reader::StreamReader;
@@ -18,8 +16,10 @@ use crate::util::write_all;
 use crate::uuid_util::parse_uuid;
 use crate::xudp::XudpMessageStream;
 
+use super::encryption::ServerEncryption;
 use super::packet_addr_stream::{VlessPacketAddrStream, is_packet_addr_location};
-use super::vision_stream::VisionStream;
+use super::vision_stream::{VisionStream, VisionWriteErrorPolicy};
+use super::vision_transport::VisionTransport;
 use super::vless_message_stream::VlessMessageStream;
 use super::vless_util::{
     COMMAND_MUX, COMMAND_TCP, COMMAND_UDP, XTLS_VISION_FLOW, parse_addons_from_reader,
@@ -32,6 +32,8 @@ pub struct VlessTcpServerHandler {
     proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
     fallback: Option<NetLocation>,
+    encryption: Option<Arc<ServerEncryption>>,
+    vision: bool,
 }
 
 impl std::fmt::Debug for VlessTcpServerHandler {
@@ -45,20 +47,30 @@ impl std::fmt::Debug for VlessTcpServerHandler {
 }
 
 impl VlessTcpServerHandler {
-    pub fn new(
+    pub(crate) fn new(
         user_id: &str,
         udp_enabled: bool,
         proxy_selector: Arc<ClientProxySelector>,
         resolver: Arc<dyn Resolver>,
         fallback: Option<NetLocation>,
-    ) -> Self {
-        Self {
-            user_id: parse_uuid(user_id).unwrap().into_boxed_slice(),
+        encryption: Option<Arc<ServerEncryption>>,
+        vision: bool,
+    ) -> std::io::Result<Self> {
+        if (vision && encryption.is_none()) || (encryption.is_some() && fallback.is_some()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Native VLESS Vision requires encryption; native encryption does not support fallback",
+            ));
+        }
+        Ok(Self {
+            user_id: parse_uuid(user_id)?.into_boxed_slice(),
             udp_enabled,
             proxy_selector,
             resolver,
             fallback,
-        }
+            encryption,
+            vision,
+        })
     }
 }
 
@@ -86,7 +98,8 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
 
     debug!("VLESS FALLBACK: Resolved {} to {}", fallback, dest_addr);
 
-    let mut dest_stream: Box<dyn AsyncStream> = Box::new(TcpStream::connect(dest_addr).await?);
+    let socket = crate::socket_util::new_tcp_socket(None, dest_addr.is_ipv6())?;
+    let mut dest_stream: Box<dyn AsyncStream> = Box::new(socket.connect(dest_addr).await?);
 
     debug!(
         "VLESS FALLBACK: Connected to fallback, forwarding {} bytes",
@@ -100,10 +113,8 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
 
     debug!("VLESS FALLBACK: Spawning bidirectional copy");
 
-    // Spawn the long-running bidirectional copy as a background task.
-    // This allows the setup to complete within the timeout while the actual
-    // data transfer runs indefinitely.
-    tokio::spawn(async move {
+    // Return the transfer to the caller so cancellation owns the entire connection.
+    Ok(TcpServerSetupResult::Session(Box::pin(async move {
         let mut client_stream = client_stream;
         let result = crate::copy_bidirectional::copy_bidirectional(
             &mut client_stream,
@@ -113,17 +124,17 @@ async fn vless_fallback_to_dest<S: AsyncStream + 'static>(
         )
         .await;
 
-        let _ = client_stream.shutdown().await;
-        let _ = dest_stream.shutdown().await;
+        futures::join!(
+            crate::util::shutdown_stream(&mut client_stream),
+            crate::util::shutdown_stream(&mut dest_stream),
+        );
 
         if let Err(e) = result {
             debug!("VLESS FALLBACK: Connection ended: {}", e);
         } else {
             debug!("VLESS FALLBACK: Connection completed");
         }
-    });
-
-    Ok(TcpServerSetupResult::AlreadyHandled)
+    })))
 }
 
 #[async_trait]
@@ -132,6 +143,22 @@ impl TcpServerHandler for VlessTcpServerHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        if let Some(encryption) = &self.encryption {
+            let stream = encryption.handshake(server_stream).await?;
+            if self.vision {
+                return setup_vision_vless_server_stream(
+                    stream,
+                    &self.user_id,
+                    self.udp_enabled,
+                    self.proxy_selector.clone(),
+                    &self.resolver,
+                    None,
+                    VisionWriteErrorPolicy::AcknowledgeAccepted,
+                )
+                .await;
+            }
+            server_stream = Box::new(stream);
+        }
         let mut stream_reader = StreamReader::new_with_buffer_size(800);
 
         let client_version = stream_reader.peek_u8(&mut server_stream).await?;
@@ -172,9 +199,14 @@ impl TcpServerHandler for VlessTcpServerHandler {
 
         let addon_length = stream_reader.read_u8(&mut server_stream).await?;
         if addon_length > 0 {
+            let message = if self.encryption.is_some() {
+                "VLESS addons not supported in current configuration, set vision: true on this VLESS server for VISION support"
+            } else {
+                "VLESS addons not supported in current configuration, use TLS protocol config for VISION support"
+            };
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "VLESS addons not supported in current configuration, use TLS protocol config for VISION support",
+                message,
             ));
         }
 
@@ -193,6 +225,9 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 {
                     // Send VLESS success response before spawning h2mux session
                     write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
+                    if self.encryption.is_some() {
+                        server_stream.flush().await?;
+                    }
 
                     let proxy_selector = self.proxy_selector.clone();
                     let resolver = self.resolver.clone();
@@ -201,7 +236,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     // Pass any unparsed data for the h2mux session
                     let initial_data = stream_reader.unparsed_data_owned();
 
-                    tokio::spawn(async move {
+                    return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                         if let Err(e) = handle_h2mux_session(
                             server_stream,
                             initial_data,
@@ -213,9 +248,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                         {
                             debug!("H2MUX session ended: {}", e);
                         }
-                    });
-
-                    return Ok(TcpServerSetupResult::AlreadyHandled);
+                    })));
                 }
 
                 let unparsed_data = stream_reader.unparsed_data();
@@ -223,7 +256,7 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 Ok(TcpServerSetupResult::TcpForward {
                     remote_location,
                     stream: server_stream,
-                    need_initial_flush: false,
+                    need_initial_flush: self.encryption.is_some(),
                     connection_success_response: Some(
                         SERVER_RESPONSE_HEADER.to_vec().into_boxed_slice(),
                     ),
@@ -257,14 +290,14 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 if is_packet_addr_location(&remote_location) {
                     Ok(TcpServerSetupResult::MultiDirectionalUdp {
                         stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
-                        need_initial_flush: false,
+                        need_initial_flush: self.encryption.is_some(),
                         proxy_selector: self.proxy_selector.clone(),
                     })
                 } else {
                     Ok(TcpServerSetupResult::BidirectionalUdp {
                         remote_location,
                         stream: Box::new(vless_stream),
-                        need_initial_flush: false,
+                        need_initial_flush: self.encryption.is_some(),
                         proxy_selector: self.proxy_selector.clone(),
                     })
                 }
@@ -280,14 +313,15 @@ impl TcpServerHandler for VlessTcpServerHandler {
                 // MUX/XUDP: Destination comes in XUDP frames, not VLESS header
                 let unparsed_data = stream_reader.unparsed_data();
                 write_all(&mut server_stream, SERVER_RESPONSE_HEADER).await?;
-                let mut xudp_stream = XudpMessageStream::new(server_stream);
+                let mut xudp_stream = XudpMessageStream::new(server_stream)
+                    .with_legacy_resolution(!self.proxy_selector.fake_dns_enabled());
                 if !unparsed_data.is_empty() {
                     xudp_stream.feed_initial_read_data(unparsed_data)?;
                 }
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
-                    need_initial_flush: false,
+                    need_initial_flush: self.encryption.is_some(),
                     proxy_selector: self.proxy_selector.clone(),
                 })
             }
@@ -301,9 +335,9 @@ impl TcpServerHandler for VlessTcpServerHandler {
     }
 }
 
-/// Setup a VISION+VLESS stream from a CryptoTlsStream (for REALITY+Vision support)
-pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
-    mut tls_stream: CryptoTlsStream<IO>,
+/// Sets up legacy Vision over a record-preserving TLS transport.
+pub(crate) async fn setup_custom_tls_vision_vless_server_stream<S>(
+    tls_stream: S,
     user_id: &[u8],
     udp_enabled: bool,
     proxy_selector: Arc<ClientProxySelector>,
@@ -311,8 +345,31 @@ pub async fn setup_custom_tls_vision_vless_server_stream<IO>(
     fallback: Option<NetLocation>,
 ) -> std::io::Result<TcpServerSetupResult>
 where
-    IO: AsyncStream + 'static,
+    S: VisionTransport + 'static,
 {
+    setup_vision_vless_server_stream(
+        tls_stream,
+        user_id,
+        udp_enabled,
+        proxy_selector,
+        resolver,
+        fallback,
+        VisionWriteErrorPolicy::Legacy,
+    )
+    .await
+}
+
+async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
+    mut tls_stream: S,
+    user_id: &[u8],
+    udp_enabled: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    fallback: Option<NetLocation>,
+    policy: VisionWriteErrorPolicy,
+) -> std::io::Result<TcpServerSetupResult> {
+    let native_encryption = policy == VisionWriteErrorPolicy::AcknowledgeAccepted;
+    tls_stream.require_record_framing()?;
     let mut stream_reader = StreamReader::new_with_buffer_size(800);
 
     let client_version = stream_reader.peek_u8(&mut tls_stream).await?;
@@ -322,6 +379,7 @@ where
             client_version
         );
         if let Some(ref fb) = fallback {
+            tls_stream.allow_streaming_reads();
             return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
         }
         return Err(std::io::Error::other(format!(
@@ -336,6 +394,7 @@ where
     if user_id.ct_eq(target_id).unwrap_u8() == 0 {
         debug!("VLESS/Vision UUID mismatch");
         if let Some(ref fb) = fallback {
+            tls_stream.allow_streaming_reads();
             return vless_fallback_to_dest(tls_stream, stream_reader, fb, resolver).await;
         }
         return Err(std::io::Error::other("Unknown user id"));
@@ -364,26 +423,25 @@ where
             debug!("Parsing remote location...");
             let remote_location =
                 parse_remote_location_from_reader(&mut stream_reader, &mut tls_stream).await?;
+            if native_encryption
+                && matches!(remote_location.address(), Address::Hostname(host) if host == MUX_DESTINATION_HOST)
+                && remote_location.port() == MUX_DESTINATION_PORT
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Native VLESS Vision does not support H2MUX",
+                ));
+            }
             debug!("Remote location parsed: {}", remote_location);
             let unparsed_data = stream_reader.unparsed_data();
 
-            let flow_stream: Box<dyn AsyncStream> = if flow == XTLS_VISION_FLOW {
-                debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
-                let (io, session) = tls_stream.into_inner();
-
-                Box::new(VisionStream::new_server(
-                    io,
-                    session,
-                    user_uuid,
-                    unparsed_data,
-                )?)
-            } else {
-                Box::new(tls_stream)
-            };
+            debug!("Creating VISION stream (Custom TLS) for flow: {}", flow);
+            let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?
+                .with_write_error_policy(policy);
 
             Ok(TcpServerSetupResult::TcpForward {
                 remote_location,
-                stream: flow_stream,
+                stream: Box::new(vision_stream),
                 need_initial_flush: false,
                 connection_success_response: None, // VisionStream will send VLESS response with first write
                 initial_remote_data: None,         // Data fed to VisionStream instead
@@ -391,6 +449,12 @@ where
             })
         }
         COMMAND_UDP => {
+            if native_encryption && !flow.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "VLESS command-2 UDP requires an empty flow with native encryption",
+                ));
+            }
             if !udp_enabled {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -404,6 +468,7 @@ where
             debug!("Remote location parsed: {}", remote_location);
             let unparsed_data = stream_reader.unparsed_data();
 
+            tls_stream.allow_streaming_reads();
             write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
             let mut vless_stream = VlessMessageStream::new(tls_stream);
             if !unparsed_data.is_empty() {
@@ -413,14 +478,14 @@ where
             if is_packet_addr_location(&remote_location) {
                 Ok(TcpServerSetupResult::MultiDirectionalUdp {
                     stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
-                    need_initial_flush: false,
+                    need_initial_flush: native_encryption,
                     proxy_selector: proxy_selector.clone(),
                 })
             } else {
                 Ok(TcpServerSetupResult::BidirectionalUdp {
                     remote_location,
                     stream: Box::new(vless_stream),
-                    need_initial_flush: false,
+                    need_initial_flush: native_encryption,
                     proxy_selector: proxy_selector.clone(),
                 })
             }
@@ -439,15 +504,13 @@ where
             if flow == XTLS_VISION_FLOW {
                 debug!("Creating VISION+XUDP stream (Custom TLS) with session-based UDP sockets");
 
-                // Extract components from CryptoTlsStream
-                let (io, session) = tls_stream.into_inner();
-
                 // Create VISION stream (will send VLESS response automatically on first write)
-                let vision_stream =
-                    VisionStream::new_server(io, session, user_uuid, unparsed_data)?;
+                let vision_stream = VisionStream::new_server(tls_stream, user_uuid, unparsed_data)?
+                    .with_write_error_policy(policy);
 
                 // Wrap VISION stream in XUDP stream
-                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream));
+                let xudp_stream = XudpMessageStream::new(Box::new(vision_stream))
+                    .with_legacy_resolution(!proxy_selector.fake_dns_enabled());
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
@@ -459,11 +522,13 @@ where
                     "Creating XUDP stream (Custom TLS, no VISION) with session-based UDP sockets"
                 );
 
+                tls_stream.allow_streaming_reads();
                 // Send VLESS response header immediately
                 write_all(&mut tls_stream, SERVER_RESPONSE_HEADER).await?;
 
                 // Wrap TLS stream in XUDP stream
-                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream));
+                let mut xudp_stream = XudpMessageStream::new(Box::new(tls_stream))
+                    .with_legacy_resolution(!proxy_selector.fake_dns_enabled());
 
                 // Feed any unparsed data to XUDP stream
                 if !unparsed_data.is_empty() {
@@ -472,7 +537,7 @@ where
 
                 Ok(TcpServerSetupResult::SessionBasedUdp {
                     stream: Box::new(xudp_stream),
-                    need_initial_flush: false, // Response already sent above
+                    need_initial_flush: native_encryption,
                     proxy_selector,
                 })
             }
@@ -481,5 +546,105 @@ where
             std::io::ErrorKind::InvalidData,
             format!("Unknown requested protocol: {unknown_protocol_type}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::Address;
+    use crate::resolver::NativeResolver;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const USER_ID: &str = "b0e80a62-8a51-47f0-91f1-f0f7faf8d9d4";
+
+    fn handler(fallback: Option<NetLocation>) -> VlessTcpServerHandler {
+        VlessTcpServerHandler::new(
+            USER_ID,
+            false,
+            Arc::new(ClientProxySelector::new(Vec::new())),
+            Arc::new(NativeResolver::new()),
+            fallback,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn probes() -> [(&'static str, Vec<u8>); 2] {
+        let mut wrong_user = vec![0];
+        wrong_user.extend_from_slice(&[0x42; 16]);
+        wrong_user.extend_from_slice(&[0, 1, 0, 80, 1, 127, 0, 0, 1]);
+        wrong_user.extend_from_slice(b"payload after the header");
+        [
+            ("wrong user id", wrong_user),
+            (
+                "non-VLESS version",
+                b"GET / HTTP/1.1\r\nHost: front.example\r\n\r\n".to_vec(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_relays_every_byte_to_the_fallback() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (name, probe) in probes() {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let fallback = NetLocation::new(
+                    Address::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+                    listener.local_addr().unwrap().port(),
+                );
+                let (server_io, mut client) = tokio::io::duplex(4096);
+                client.write_all(&probe).await.unwrap();
+                let setup = handler(Some(fallback))
+                    .setup_server_stream(Box::new(server_io))
+                    .await
+                    .unwrap();
+                let TcpServerSetupResult::Session(session) = setup else {
+                    panic!("{name}: expected a fallback session");
+                };
+                let session = tokio::spawn(session);
+                let (mut origin, _) = listener.accept().await.unwrap();
+
+                let mut forwarded = vec![0; probe.len()];
+                origin.read_exact(&mut forwarded).await.unwrap();
+                assert_eq!(forwarded, probe, "{name}");
+                client.write_all(b" and later bytes").await.unwrap();
+                let mut later = [0; 16];
+                origin.read_exact(&mut later).await.unwrap();
+                assert_eq!(&later, b" and later bytes", "{name}");
+
+                origin.write_all(b"camouflage reply").await.unwrap();
+                origin.shutdown().await.unwrap();
+                let mut reply = [0; 16];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"camouflage reply", "{name}");
+                client.shutdown().await.unwrap();
+                assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0, "{name}");
+                session.await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_authentication_without_a_fallback_is_an_error() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (name, probe) in probes() {
+                let (server_io, mut client) = tokio::io::duplex(4096);
+                client.write_all(&probe).await.unwrap();
+                assert!(
+                    handler(None)
+                        .setup_server_stream(Box::new(server_io))
+                        .await
+                        .is_err(),
+                    "{name}"
+                );
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -22,6 +22,80 @@ use crate::tcp::tcp_handler::{
 };
 use crate::util::write_all;
 
+#[cfg(test)]
+mod client_handshake_tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Debug, Default)]
+    struct RecordingStream(Arc<parking_lot::Mutex<Vec<Vec<u8>>>>);
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.0.lock().push(bytes.to_vec());
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl crate::async_stream::AsyncPing for RecordingStream {
+        fn supports_ping(&self) -> bool {
+            false
+        }
+        fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+            Poll::Ready(Ok(false))
+        }
+    }
+    impl AsyncStream for RecordingStream {}
+
+    #[tokio::test]
+    async fn client_submits_complete_handshake_in_one_write() {
+        for address in ["example.com:443", "127.0.0.1:80", "[::1]:8080"] {
+            let handler = TrojanTcpHandler::new_client("password", &None);
+            let location = crate::address::NetLocation::from_str(address, None).unwrap();
+            let stream = RecordingStream::default();
+            let writes = stream.0.clone();
+            handler
+                .setup_client_tcp_stream(Box::new(stream), (&location).into())
+                .await
+                .unwrap();
+            let expected = [
+                create_password_hash("password").as_ref(),
+                &CRLF_BYTES,
+                &[CMD_CONNECT],
+                &write_location_to_vec(&location),
+                &CRLF_BYTES,
+            ]
+            .concat();
+            assert_eq!(*writes.lock(), vec![expected]);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ShadowsocksData {
     cipher: ShadowsocksCipher,
@@ -172,7 +246,7 @@ impl TcpServerHandler for TrojanTcpHandler {
 
             let initial_data = stream_reader.unparsed_data_owned();
 
-            tokio::spawn(async move {
+            return Ok(TcpServerSetupResult::Session(Box::pin(async move {
                 if let Err(e) = handle_h2mux_session(
                     server_stream,
                     initial_data,
@@ -184,9 +258,7 @@ impl TcpServerHandler for TrojanTcpHandler {
                 {
                     debug!("Trojan h2mux session ended: {}", e);
                 }
-            });
-
-            return Ok(TcpServerSetupResult::AlreadyHandled);
+            })));
         }
 
         Ok(TcpServerSetupResult::TcpForward {
@@ -227,12 +299,15 @@ impl TcpClientHandler for TrojanTcpHandler {
             ));
         }
 
-        write_all(&mut client_stream, &self.password_hash).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
-        write_all(&mut client_stream, &[CMD_CONNECT]).await?;
         let location_bytes = write_location_to_vec(remote_location.location());
-        write_all(&mut client_stream, &location_bytes).await?;
-        write_all(&mut client_stream, &CRLF_BYTES).await?;
+        // Xray's Trojan inbound requires the credentials in its first read.
+        let mut header = Vec::with_capacity(self.password_hash.len() + location_bytes.len() + 5);
+        header.extend_from_slice(&self.password_hash);
+        header.extend_from_slice(&CRLF_BYTES);
+        header.push(CMD_CONNECT);
+        header.extend_from_slice(&location_bytes);
+        header.extend_from_slice(&CRLF_BYTES);
+        write_all(&mut client_stream, &header).await?;
         client_stream.flush().await?;
         Ok(TcpClientSetupResult {
             client_stream,
@@ -266,4 +341,135 @@ fn create_password_hash(password: &str) -> Box<[u8]> {
         );
     }
     hex_bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::address::NetLocation;
+    use crate::resolver::NativeResolver;
+    use std::io::ErrorKind;
+    use tokio::io::AsyncReadExt;
+
+    fn handler() -> TrojanTcpHandler {
+        TrojanTcpHandler::new_server(
+            "password",
+            &None,
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        )
+    }
+
+    fn request(location: &NetLocation) -> Vec<u8> {
+        // SHA-224("password"), independently fixed to verify client wire encoding too.
+        let mut request =
+            b"d63dc919e201d7bc4c825630d2cf25fdc93d4b2f0d46706d29038d01\r\n\x01".to_vec();
+        request.extend_from_slice(&write_location_to_vec(location));
+        request.extend_from_slice(b"\r\n");
+        request
+    }
+
+    #[tokio::test]
+    async fn ordinary_connect_preserves_coalesced_payload() {
+        let location = NetLocation::from_str("example.com:443", None).unwrap();
+        let mut request = request(&location);
+        request.extend_from_slice(b"payload");
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let result = handler()
+            .setup_server_stream(Box::new(server))
+            .await
+            .unwrap();
+        let TcpServerSetupResult::TcpForward {
+            remote_location,
+            initial_remote_data,
+            connection_success_response,
+            need_initial_flush,
+            ..
+        } = result
+        else {
+            panic!("expected TCP forwarding");
+        };
+        assert_eq!(remote_location, location);
+        assert_eq!(initial_remote_data.as_deref(), Some(&b"payload"[..]));
+        assert!(connection_success_response.is_none());
+        assert!(!need_initial_flush);
+    }
+
+    #[tokio::test]
+    async fn client_emits_hash_connect_address_and_suffix() {
+        let location = NetLocation::from_str("example.com:443", None).unwrap();
+        let (client, mut server) = tokio::io::duplex(1024);
+        let result = TrojanTcpHandler::new_client("password", &None)
+            .setup_client_tcp_stream(Box::new(client), location.clone().into())
+            .await
+            .unwrap();
+        assert!(result.early_data.is_none());
+        drop(result);
+        let expected = request(&location);
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_never_produce_forwarding_work() {
+        let valid = request(&NetLocation::from_str("example.com:443", None).unwrap());
+        let mut cases = vec![(b"short\r\n".to_vec(), ErrorKind::Other)];
+        let mut wrong_hash = valid.clone();
+        wrong_hash[0] = b'0';
+        cases.push((wrong_hash, ErrorKind::Other));
+        for command in [CMD_UDP_ASSOCIATE, 0xff] {
+            let mut request = valid.clone();
+            request[58] = command;
+            cases.push((request, ErrorKind::InvalidInput));
+        }
+        let mut bad_address = valid.clone();
+        bad_address[59] = 0xff;
+        cases.push((bad_address, ErrorKind::InvalidInput));
+        cases.push((valid[..62].to_vec(), ErrorKind::ConnectionAborted));
+        let mut bad_suffix = valid;
+        *bad_suffix.last_mut().unwrap() = b'x';
+        cases.push((bad_suffix, ErrorKind::Other));
+        for (request, kind) in cases {
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            assert_eq!(
+                handler()
+                    .setup_server_stream(Box::new(server))
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                kind
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_mux_session_releases_transport() {
+        let location = NetLocation::new(
+            Address::Hostname(MUX_DESTINATION_HOST.into()),
+            MUX_DESTINATION_PORT,
+        );
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&request(&location)).await.unwrap();
+        client.shutdown().await.unwrap();
+        let TcpServerSetupResult::Session(session) = handler()
+            .setup_server_stream(Box::new(server))
+            .await
+            .unwrap()
+        else {
+            panic!("expected multiplexed session");
+        };
+        drop(session);
+        let mut byte = [0];
+        let read = std::pin::pin!(client.read(&mut byte));
+        assert!(matches!(
+            futures::poll!(read),
+            std::task::Poll::Ready(Ok(0))
+        ));
+    }
 }

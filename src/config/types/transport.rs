@@ -15,6 +15,8 @@ pub enum BindLocation {
     #[serde(alias = "addresses")]
     Address(OneOrSome<NetLocationPortRange>),
     Path(PathBuf),
+    #[serde(untagged)]
+    Unspecified {},
 }
 
 impl std::fmt::Display for BindLocation {
@@ -30,6 +32,7 @@ impl std::fmt::Display for BindLocation {
                 Ok(())
             }
             BindLocation::Path(p) => write!(f, "{}", p.display()),
+            BindLocation::Unspecified {} => f.write_str("no listener"),
         }
     }
 }
@@ -64,7 +67,18 @@ impl Default for TcpConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerQuicConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_source: Option<String>,
+    #[serde(skip)]
+    pub certificate_binding: Option<std::sync::Arc<crate::certificates::Source>>,
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
+    #[serde(default)]
     pub cert: String,
+    #[serde(default)]
     pub key: String,
     #[serde(alias = "alpn_protocol", default)]
     pub alpn_protocols: NoneOrSome<String>,
@@ -79,6 +93,11 @@ pub struct ServerQuicConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ClientQuicConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "super::tls::TlsKeyExchangeGroups::is_default"
+    )]
+    pub key_exchange_groups: super::tls::TlsKeyExchangeGroups,
     #[serde(default = "default_true")]
     pub verify: bool,
     #[serde(alias = "server_fingerprint", default)]
@@ -96,6 +115,7 @@ pub struct ClientQuicConfig {
 impl Default for ClientQuicConfig {
     fn default() -> Self {
         Self {
+            key_exchange_groups: Default::default(),
             verify: true,
             server_fingerprints: NoneOrSome::Unspecified,
             sni_hostname: NoneOrOne::Unspecified,

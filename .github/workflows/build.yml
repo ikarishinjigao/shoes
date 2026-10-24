@@ -59,7 +59,7 @@ jobs:
           #   binary_name: shoes.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -133,8 +133,11 @@ jobs:
           fi
           
           # Create tarball
+          cp THIRD_PARTY_NOTICES.md artifacts/
+          cp -R licenses artifacts/
           cd artifacts
-          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}"
+          tar -czf ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz "${{ matrix.binary_name }}" THIRD_PARTY_NOTICES.md licenses
+          python3 ../scripts/check-release-notices.py ${{ github.event.repository.name }}-${{ matrix.target }}.tar.gz
           
           # Debug: show what files were created
           echo "Contents of artifacts directory:"
@@ -176,7 +179,7 @@ jobs:
           fi
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ github.event.repository.name }}-${{ matrix.target }}
           path: |
@@ -193,7 +196,7 @@ jobs:
       contents: write
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -209,7 +212,7 @@ jobs:
           ls -la release-artifacts/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: release-artifacts/*
           draft: true

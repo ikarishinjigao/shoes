@@ -1,23 +1,33 @@
-// CryptoTlsStream: Async wrapper around CryptoConnection
-//
-// This provides AsyncRead + AsyncWrite for CryptoConnection (rustls or Reality),
-// allowing it to work with tokio-based async code.
-//
-// IMPORTANT: The TLS handshake must be completed via perform_crypto_handshake()
-// BEFORE wrapping in CryptoTlsStream. This stream handles only post-handshake
-// application data.
-//
-// Based on tokio-rustls's TlsStream pattern.
+//! Owns TLS input, handshake state, and output across protocol transitions.
 
+use bytes::{Buf, Bytes};
+use futures::ready;
 use std::io::{self, BufRead, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::crypto_connection::CryptoConnection;
+use super::TlsConnection;
+use super::tls_deframer::TlsDeframer;
 use crate::async_stream::{AsyncPing, AsyncStream};
 use crate::sync_adapter::{SyncReadAdapter, SyncWriteAdapter};
+
+/// Select before any handshake input reaches the crypto backend.
+#[derive(Clone, Copy)]
+pub enum TlsReadMode {
+    Stream,
+    PreserveRecords,
+}
+
+enum TlsInput {
+    Stream,
+    Records {
+        deframer: TlsDeframer,
+        preserve: bool,
+    },
+    Raw(Bytes),
+}
 
 /// TLS connection state machine (mirrors tokio-rustls TlsState)
 ///
@@ -67,381 +77,471 @@ impl TlsState {
     }
 }
 
-/// Async stream wrapper for Connection enum
-///
-/// This combines a Connection (rustls or REALITY) with an async I/O stream,
-/// providing AsyncRead + AsyncWrite interface.
 pub struct CryptoTlsStream<IO> {
-    /// The underlying async I/O stream (e.g., TcpStream)
     io: IO,
-    /// The crypto connection (rustls or REALITY)
-    session: CryptoConnection,
-    /// Connection state machine for tracking shutdown
+    pub(super) session: TlsConnection,
     state: TlsState,
-    /// Whether a flush is pending (tokio-rustls pattern)
     need_flush: bool,
+    input: TlsInput,
+    write_raw: bool,
+    raw_write_prefix: Option<Bytes>,
 }
 
-impl<IO> CryptoTlsStream<IO>
-where
-    IO: AsyncStream,
-{
-    /// Create a new CryptoTlsStream
-    ///
-    /// IMPORTANT: The handshake must already be complete. Use perform_crypto_handshake()
-    /// before calling this constructor.
-    pub fn new(io: IO, session: CryptoConnection) -> Self {
-        assert!(
-            !session.is_handshaking(),
-            "perform_crypto_handshake should have completed"
-        );
-        CryptoTlsStream {
+impl<IO: AsyncStream> CryptoTlsStream<IO> {
+    pub async fn handshake(
+        io: IO,
+        session: TlsConnection,
+        mode: TlsReadMode,
+        preread: &[u8],
+    ) -> io::Result<Self> {
+        let preserve = matches!(mode, TlsReadMode::PreserveRecords);
+        let input = if preserve || !preread.is_empty() {
+            let mut deframer = TlsDeframer::new();
+            deframer.feed(preread);
+            TlsInput::Records { deframer, preserve }
+        } else {
+            TlsInput::Stream
+        };
+        let mut stream = Self::with_input(io, session, input);
+        super::crypto_handshake::perform_crypto_handshake(&mut stream).await?;
+        Ok(stream)
+    }
+
+    fn with_input(io: IO, session: TlsConnection, input: TlsInput) -> Self {
+        Self {
             io,
             session,
             state: TlsState::Stream,
             need_flush: false,
+            input,
+            write_raw: false,
+            raw_write_prefix: None,
         }
     }
 
-    /// Extract the underlying I/O stream and crypto session
-    ///
-    /// This consumes the CryptoTlsStream and returns its components.
-    /// Useful for scenarios like Vision that need direct access to both.
-    pub fn into_inner(self) -> (IO, CryptoConnection) {
-        (self.io, self.session)
+    #[cfg(test)]
+    pub fn new(io: IO, session: TlsConnection, deframer: Option<TlsDeframer>) -> Self {
+        assert!(!session.is_handshaking());
+        let input = match deframer {
+            Some(deframer) => TlsInput::Records {
+                deframer,
+                preserve: true,
+            },
+            None => TlsInput::Stream,
+        };
+        Self::with_input(io, session, input)
     }
 
-    /// Get the negotiated ALPN protocol, if any
-    ///
-    /// Returns the ALPN protocol that was negotiated during the TLS handshake.
-    /// For REALITY connections, this always returns None.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.session.alpn_protocol()
     }
 
-    /// Check if this is a REALITY connection
-    ///
-    /// REALITY connections have already authenticated the client during
-    /// the handshake, so they can be trusted for protocol handling.
+    pub fn negotiated_group(&self) -> Option<rustls::NamedGroup> {
+        self.session.negotiated_group()
+    }
+
     pub fn is_reality(&self) -> bool {
         self.session.is_reality()
     }
 
-    /// Write TLS data directly to the underlying stream
-    ///
-    /// Returns Poll::Ready(Ok(n)) with bytes written, or Poll::Pending if would block.
-    fn write_tls_direct(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    pub fn is_server(&self) -> bool {
+        self.session.is_server()
+    }
+
+    pub fn is_client(&self) -> bool {
+        self.session.is_client()
+    }
+
+    pub fn require_record_framing(&self) -> io::Result<()> {
+        match self.input {
+            TlsInput::Records { preserve: true, .. } => Ok(()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vision requires record-preserving TLS input from handshake start",
+            )),
+        }
+    }
+
+    /// Once handoff is ruled out, drain seeded records without reading ahead, then
+    /// return to allocation-free backend reads at the next buffered boundary.
+    pub fn allow_streaming_reads(&mut self) {
+        if let TlsInput::Records { preserve, .. } = &mut self.input {
+            *preserve = false;
+        }
+        self.release_empty_deframer();
+    }
+
+    fn release_empty_deframer(&mut self) {
+        if matches!(&self.input, TlsInput::Records { deframer, preserve: false }
+            if deframer.pending_bytes() == 0)
+        {
+            self.input = TlsInput::Stream;
+        }
+    }
+
+    fn take_plaintext(&mut self) -> io::Result<Vec<u8>> {
+        let mut plaintext = Vec::new();
+        let mut reader = self.session.reader();
+        loop {
+            match reader.fill_buf() {
+                Ok([]) => break,
+                Ok(bytes) => {
+                    plaintext.extend_from_slice(bytes);
+                    let len = bytes.len();
+                    reader.consume(len);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(plaintext)
+    }
+
+    /// Session plaintext precedes the opaque transport tail, even if DIRECT was
+    /// parsed from a small caller buffer in the middle of a decrypted record.
+    pub fn start_raw_read(&mut self) -> io::Result<()> {
+        self.require_record_framing()?;
+        let mut pending = self.take_plaintext()?;
+        let TlsInput::Records { deframer, .. } =
+            std::mem::replace(&mut self.input, TlsInput::Stream)
+        else {
+            unreachable!()
+        };
+        pending.extend_from_slice(&deframer.into_remaining_data());
+        self.input = TlsInput::Raw(pending.into());
+        Ok(())
+    }
+
+    pub fn start_raw_write(&mut self, mut final_plaintext: &[u8]) -> io::Result<()> {
+        if self.write_raw {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS output has already switched to raw mode",
+            ));
+        }
+
+        // Freeze the final TLS flight before reads can queue alerts or KeyUpdate
+        // responses. Reads remain independent while this prefix drains and flushes.
+        let mut prefix = Vec::new();
+        loop {
+            while self.session.wants_write() {
+                if self.session.write_tls(&mut prefix)? == 0 {
+                    return Err(io::ErrorKind::WriteZero.into());
+                }
+            }
+            if final_plaintext.is_empty() {
+                break;
+            }
+            let written = self.session.writer().write(final_plaintext)?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            final_plaintext = &final_plaintext[written..];
+            self.session.writer().flush()?;
+        }
+        self.raw_write_prefix = Some(prefix.into());
+        self.write_raw = true;
+        Ok(())
+    }
+
+    pub(super) fn poll_receive_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let n = match &mut self.input {
+            TlsInput::Stream => {
+                let mut adapter = SyncReadAdapter {
+                    io: &mut self.io,
+                    cx,
+                };
+                match self.session.read_tls(&mut adapter) {
+                    Ok(n) => n,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        return Poll::Pending;
+                    }
+                    Err(error) => return Poll::Ready(Err(error)),
+                }
+            }
+            TlsInput::Records { deframer, preserve } => {
+                let mut scratch = [0; 4096];
+                let record =
+                    ready!(deframer.poll_read_record(&mut self.io, cx, &mut scratch, *preserve))?;
+                self.release_empty_deframer();
+                match record {
+                    Some(record) => {
+                        self.session
+                            .feed(&record)
+                            .map_err(|error| self.packet_error(error))?;
+                        record.len()
+                    }
+                    // rustls must see physical EOF to report missing close_notify.
+                    None => self.session.read_tls(&mut io::empty())?,
+                }
+            }
+            TlsInput::Raw(_) => unreachable!("raw input bypasses TLS"),
+        };
+        if n != 0 {
+            let plaintext_len = self
+                .session
+                .process_new_packets()
+                .map_err(|error| self.packet_error(error))?;
+            log::trace!("TLS received {n} bytes, {plaintext_len} plaintext bytes available");
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn packet_error(&self, error: io::Error) -> io::Error {
+        if !self.session.is_reality() {
+            return error;
+        }
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "reality {} error processing new packets: {:?}",
+                if self.session.is_server() {
+                    "server"
+                } else {
+                    "client"
+                },
+                error
+            ),
+        )
+    }
+
+    fn poll_write_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         let mut adapter = SyncWriteAdapter {
             io: &mut self.io,
             cx,
         };
         match self.session.write_tls(&mut adapter) {
-            Ok(n) => Poll::Ready(Ok(n)),
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
-            Err(e) => Poll::Ready(Err(e)),
+            Ok(n) => {
+                self.need_flush |= n != 0;
+                Poll::Ready(Ok(n))
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            Err(error) => Poll::Ready(Err(error)),
         }
     }
 
-    /// Drain all pending TLS writes to the underlying stream
-    ///
-    /// Note: This is used for best-effort draining (e.g., sending alerts on error).
-    /// WriteZero is not treated as fatal here since the caller may want to continue
-    /// even if some writes fail.
-    fn drain_all_writes(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.session.wants_write() {
-            match self.write_tls_direct(cx) {
-                Poll::Ready(Ok(0)) => {
-                    // WriteZero - can't make progress, but not fatal for drain
-                    break;
+    pub fn poll_drain_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The peer no longer accepts TLS records once this direction is raw.
+        if let Some(prefix) = &mut self.raw_write_prefix {
+            while !prefix.is_empty() {
+                let written = ready!(Pin::new(&mut self.io).poll_write(cx, prefix))?;
+                if written == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
-                Poll::Ready(Ok(_)) => {
-                    self.need_flush = true;
+                prefix.advance(written);
+                self.need_flush = true;
+            }
+        } else if !self.write_raw {
+            while self.session.wants_write() {
+                if ready!(self.poll_write_tls(cx))? == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
             }
         }
         Poll::Ready(Ok(()))
     }
 }
 
-impl<IO> AsyncRead for CryptoTlsStream<IO>
-where
-    IO: AsyncStream,
-{
+impl<IO: AsyncStream> AsyncRead for CryptoTlsStream<IO> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-
-        // If read side is shut down, return EOF immediately
-        if !this.state.readable() {
+        if buf.remaining() == 0 || !this.state.readable() {
             return Poll::Ready(Ok(()));
         }
-
-        // Note: Handshake is already complete - perform_crypto_handshake() is always
-        // called before CryptoTlsStream::new()
-
-        // Track whether we did any I/O that returned Pending
-        let mut io_pending = false;
-        let mut eof = false;
-
-        // Read from TCP while the session wants more data (tokio-rustls pattern)
-        while this.state.readable() && this.session.wants_read() {
-            let mut adapter = SyncReadAdapter {
-                io: &mut this.io,
-                cx,
-            };
-            match this.session.read_tls(&mut adapter) {
-                Ok(0) => {
-                    eof = true;
-                    break;
-                }
-                Ok(_) => {
-                    // Process encrypted data - try to send alerts on error
-                    if let Err(e) = this.session.process_new_packets() {
-                        // Try last-gasp write to send any pending TLS alerts (tokio-rustls pattern)
-                        let _ = this.drain_all_writes(cx);
-                        return Poll::Ready(Err(e));
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    io_pending = true;
-                    break;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
+        if let TlsInput::Raw(pending) = &mut this.input {
+            if !pending.is_empty() {
+                let len = buf.remaining().min(pending.len());
+                buf.put_slice(&pending[..len]);
+                pending.advance(len);
+                return Poll::Ready(Ok(()));
             }
+            return Pin::new(&mut this.io).poll_read(cx, buf);
         }
 
-        // Try to get decrypted data from session buffer
-        let mut reader = this.session.reader();
-        match reader.fill_buf() {
-            Ok(available) if !available.is_empty() => {
-                // Copy directly from session buffer to user buffer
-                let len = buf.remaining().min(available.len());
-                buf.put_slice(&available[..len]);
-                reader.consume(len);
-                Poll::Ready(Ok(()))
-            }
-            Ok(_) => {
-                // Empty buffer from fill_buf() means CloseNotify received (clean TLS EOF)
-                // This matches rustls behavior where Ok(&[]) signals clean shutdown
-                this.state.shutdown_read();
-                Poll::Ready(Ok(()))
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // No data available, connection still active
-                if eof {
-                    // TCP EOF without CloseNotify - unclean shutdown
-                    this.state.shutdown_read();
-                    Poll::Ready(Ok(()))
-                } else if io_pending {
-                    // We tried to read and got WouldBlock - wait for more data
-                    Poll::Pending
-                } else {
-                    // wants_read() returned false but no data - need to read from TCP
-                    // This can happen if we need to fetch more ciphertext
-                    // Try one read to register with reactor, then return Pending
-                    let mut adapter = SyncReadAdapter {
-                        io: &mut this.io,
-                        cx,
-                    };
-                    match this.session.read_tls(&mut adapter) {
-                        Ok(0) => {
-                            this.state.shutdown_read();
-                            Poll::Ready(Ok(()))
-                        }
-                        Ok(_) => {
-                            // Got data, process and wake to retry
-                            let _ = this.session.process_new_packets();
-                            cx.waker().wake_by_ref();
-                            Poll::Pending
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Now properly registered with reactor
-                            Poll::Pending
-                        }
-                        Err(e) => Poll::Ready(Err(e)),
-                    }
+        loop {
+            // Deliver plaintext before consuming another outer record. DIRECT may
+            // be in these bytes, with opaque data immediately after that record.
+            let mut reader = this.session.reader();
+            match reader.fill_buf() {
+                Ok(available) if !available.is_empty() => {
+                    let len = buf.remaining().min(available.len());
+                    buf.put_slice(&available[..len]);
+                    reader.consume(len);
+                    return Poll::Ready(Ok(()));
                 }
+                Ok(_) => {
+                    this.state.shutdown_read();
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Poll::Ready(Err(error)),
             }
-            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                // Connection aborted - mark read side as shut down
-                this.state.shutdown_read();
-                Poll::Ready(Err(e))
+            // Service post-handshake responses without blocking readable plaintext
+            // on output backpressure. Both I/O directions register their wakers.
+            if let Poll::Ready(Err(error)) = Pin::new(&mut *this).poll_flush(cx) {
+                return Poll::Ready(Err(error));
             }
-            Err(e) => Poll::Ready(Err(e)),
+            if let Err(error) = ready!(this.poll_receive_tls(cx)) {
+                let _ = this.poll_drain_tls(cx);
+                return Poll::Ready(Err(error));
+            }
         }
     }
 }
 
-impl<IO> AsyncWrite for CryptoTlsStream<IO>
-where
-    IO: AsyncStream,
-{
+impl<IO: AsyncStream> AsyncWrite for CryptoTlsStream<IO> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Check if write side is shut down
         if !self.state.writeable() {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "write side is shut down",
             )));
         }
-
-        // Note: Handshake is already complete - perform_crypto_handshake() is always
-        // called before CryptoTlsStream::new()
-
-        let mut pos = 0;
-
-        while pos < buf.len() {
-            let mut would_block = false;
-
-            // Write plaintext to session
-            match self.session.writer().write(&buf[pos..]) {
-                Ok(n) => pos += n,
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-
-            // Drain TLS output to TCP stream
-            while self.session.wants_write() {
-                match self.write_tls_direct(cx) {
-                    Poll::Ready(Ok(0)) => {
-                        return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                    }
-                    Poll::Pending => {
-                        would_block = true;
-                        self.need_flush = true;
-                        break;
-                    }
-                    Poll::Ready(Ok(_)) => {
-                        self.need_flush = true;
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                }
+        if self.write_raw {
+            if self.raw_write_prefix.is_some() {
+                ready!(self.as_mut().poll_flush(cx))?;
             }
-
-            return match (pos, would_block) {
-                (0, true) => Poll::Pending,
-                (n, true) => Poll::Ready(Ok(n)), // Partial write
-                (_, false) => continue,          // Keep writing
-            };
+            return Pin::new(&mut self.io).poll_write(cx, buf);
         }
 
+        let mut pos = 0;
+        while pos < buf.len() {
+            pos += self.session.writer().write(&buf[pos..])?;
+            match self.poll_drain_tls(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending if pos == 0 => return Poll::Pending,
+                Poll::Pending => return Poll::Ready(Ok(pos)),
+            }
+        }
         Poll::Ready(Ok(pos))
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Flush the session writer first (tokio-rustls pattern)
-        // This ensures any buffered plaintext is moved to the TLS output buffer
-        self.session.writer().flush()?;
-
-        // Drain all pending TLS writes
-        while self.session.wants_write() {
-            match self.write_tls_direct(cx) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-                Poll::Ready(Ok(_)) => {
-                    self.need_flush = true;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if !self.state.writeable() {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "write side is shut down",
+            )));
+        }
+        if self.write_raw {
+            if self.raw_write_prefix.is_some() {
+                ready!(self.as_mut().poll_flush(cx))?;
             }
+            return Pin::new(&mut self.io).poll_write_vectored(cx, bufs);
+        }
+        if bufs.iter().all(|buf| buf.is_empty()) {
+            return Poll::Ready(Ok(0));
         }
 
-        // Flush underlying stream if we have pending data
-        if self.need_flush {
-            match Pin::new(&mut self.io).poll_flush(cx) {
-                Poll::Ready(Ok(())) => {
-                    self.need_flush = false;
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                Poll::Pending => Poll::Pending,
+        loop {
+            let written = self.session.writer().write_vectored(bufs)?;
+            let pending = match self.poll_drain_tls(cx) {
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => false,
+                Poll::Pending => true,
+            };
+            if written > 0 {
+                return Poll::Ready(Ok(written));
             }
-        } else {
-            Poll::Ready(Ok(()))
+            if pending {
+                return Poll::Pending;
+            }
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // 1. First drain any pending application data (before sending close_notify)
-        //    This is important because REALITY's write_tls() does lazy encryption -
-        //    plaintext is encrypted when write_tls() is called, not when written to
-        //    the session. If we send close_notify first, it would be queued before
-        //    the application data gets encrypted, resulting in wrong wire order.
-        while self.session.wants_write() {
-            match self.write_tls_direct(cx) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+    fn is_write_vectored(&self) -> bool {
+        if self.write_raw {
+            self.io.is_write_vectored()
+        } else {
+            !self.session.is_reality()
         }
+    }
 
-        // 2. Send close_notify once (when write side is still open)
-        if self.state.writeable() {
-            self.session.send_close_notify();
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.write_raw {
+            ready!(self.poll_drain_tls(cx))?;
+            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+            self.raw_write_prefix = None;
+            self.need_flush = false;
+            return Poll::Ready(Ok(()));
+        }
+        self.session.writer().flush()?;
+        ready!(self.poll_drain_tls(cx))?;
+        if self.need_flush {
+            ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+            self.need_flush = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.write_raw {
+            if self.state.writeable() {
+                self.session.send_close_notify();
+                self.state.shutdown_write();
+            }
+            // A failed ordinary TLS session still has output to send before writer.flush fails.
+            ready!(self.poll_drain_tls(cx))?;
+            ready!(self.as_mut().poll_flush(cx))?;
+        } else {
+            ready!(self.as_mut().poll_flush(cx))?;
             self.state.shutdown_write();
         }
-
-        // 3. Drain the close_notify alert
-        while self.session.wants_write() {
-            match self.write_tls_direct(cx) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                }
-                Poll::Ready(Ok(_)) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        // 4. Shutdown underlying stream - ignore NotConnected errors (tokio-rustls pattern)
         match Pin::new(&mut self.io).poll_shutdown(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::NotConnected => {
-                // When trying to shutdown, not being connected is fine
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::NotConnected => {
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+            result => result,
         }
     }
 }
 
-impl<IO> AsyncPing for CryptoTlsStream<IO>
-where
-    IO: AsyncStream,
-{
+impl<IO: AsyncStream> AsyncPing for CryptoTlsStream<IO> {
     fn supports_ping(&self) -> bool {
         self.io.supports_ping()
     }
 
-    fn poll_write_ping(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<bool>> {
-        Pin::new(&mut self.io).poll_write_ping(cx)
+    fn poll_write_ping(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        let written = ready!(Pin::new(&mut self.io).poll_write_ping(cx))?;
+        self.need_flush |= written;
+        Poll::Ready(Ok(written))
     }
 }
 
-// Implement AsyncStream blanket trait
-impl<IO> crate::async_stream::AsyncStream for CryptoTlsStream<IO> where IO: AsyncStream {}
+impl<IO: AsyncStream> AsyncStream for CryptoTlsStream<IO> {
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.io.peer_addr()
+    }
+    #[cfg(target_os = "linux")]
+    fn plain_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        if self.state != TlsState::Stream
+            || !matches!(&self.input, TlsInput::Raw(pending) if pending.is_empty())
+            || !self.write_raw
+            || self.raw_write_prefix.is_some()
+            || self.need_flush
+        {
+            return None;
+        }
+        self.io.plain_tcp()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{Address, NetLocation};
-    use crate::reality::{RealityServerConfig, RealityServerConnection};
     use futures::task::noop_waker_ref;
 
     struct PendingWriteIo;
@@ -528,28 +628,373 @@ mod tests {
 
     impl AsyncStream for ZeroWriteIo {}
 
-    fn completed_reality_connection() -> RealityServerConnection {
-        let config = RealityServerConfig {
-            private_key: [0; 32],
-            short_ids: vec![[0; 8]],
-            dest: NetLocation::new(Address::UNSPECIFIED, 443),
-            max_time_diff: None,
-            min_client_version: None,
-            max_client_version: None,
-            cipher_suites: Vec::new(),
+    fn completed_reality_connection() -> TlsConnection {
+        crate::reality::established_pair().1
+    }
+
+    #[tokio::test]
+    async fn reality_certificate_errors_match_across_read_modes() {
+        use aws_lc_rs::agreement;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let public_key = agreement::PrivateKey::from_private_key(&agreement::X25519, &[1; 32])
+            .unwrap()
+            .compute_public_key()
+            .unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert.cert.der().clone()],
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                        .into(),
+                )
+                .unwrap(),
+        );
+        for (mode, preread) in [
+            (TlsReadMode::Stream, false),
+            (TlsReadMode::PreserveRecords, false),
+            (TlsReadMode::Stream, true),
+        ] {
+            let mut client = crate::reality::RealityClientConfig {
+                mldsa65_verify: None,
+                public_key: public_key.as_ref().try_into().unwrap(),
+                short_id: [0; 8],
+                server_name: "localhost".try_into().unwrap(),
+                cipher_suites: Vec::new(),
+            }
+            .create_connection()
+            .unwrap();
+            let mut server =
+                TlsConnection::new(rustls::ServerConnection::new(server_config.clone()).unwrap());
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello).unwrap();
+            server.feed(&hello).unwrap();
+            let mut flight = Vec::new();
+            server.write_tls(&mut flight).unwrap();
+            let (io, mut peer) = tokio::io::duplex(65536);
+            if !preread {
+                peer.write_all(&flight).await.unwrap();
+            }
+            let error =
+                CryptoTlsStream::handshake(io, client, mode, if preread { &flight } else { &[] })
+                    .await
+                    .err()
+                    .expect("a real target certificate must not authenticate REALITY");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .starts_with("reality client error processing new packets:")
+            );
+            let mut output = Vec::new();
+            peer.read_to_end(&mut output).await.unwrap();
+            // Record-preserving reads may send a compatibility CCS before the certificate arrives.
+            assert!(
+                output.is_empty() || output == [20, 3, 3, 0, 1, 1],
+                "failed REALITY authentication must not send alerts: {output:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reality_shutdown_preserves_buffered_data_before_close_notify() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = crate::reality::established_pair();
+        let (io, peer) = tokio::io::duplex(16);
+        let mut sender = CryptoTlsStream::new(io, client, None);
+        let mut receiver = CryptoTlsStream::new(peer, server, None);
+        let payload = vec![42; 40_000];
+        sender.write_all(&payload).await.unwrap();
+        assert!(sender.session.wants_write());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut sender).poll_shutdown(&mut cx).is_pending());
+
+        let mut received = Vec::new();
+        let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(sender.shutdown(), receiver.read_to_end(&mut received))
+        })
+        .await
+        .unwrap();
+        shutdown.unwrap();
+        read.unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn raw_tcp_capability_requires_drained_io_and_open_directions() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (socket, peer) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let _peer = peer.unwrap();
+        let session = completed_reality_connection();
+        let mut stream = CryptoTlsStream::new(socket.unwrap(), session, Some(TlsDeframer::new()));
+        assert!(stream.plain_tcp().is_none());
+        stream.start_raw_read().unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.start_raw_write(b"").unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.flush().await.unwrap();
+        assert!(stream.plain_tcp().is_some());
+
+        stream.input = TlsInput::Raw(Bytes::from_static(b"transport tail"));
+        assert!(stream.plain_tcp().is_none());
+        let mut tail = [0; 14];
+        stream.read_exact(&mut tail[..1]).await.unwrap();
+        assert!(stream.plain_tcp().is_none());
+        stream.read_exact(&mut tail[1..]).await.unwrap();
+        assert_eq!(&tail, b"transport tail");
+        assert!(stream.plain_tcp().is_some());
+
+        stream.need_flush = true;
+        assert!(stream.plain_tcp().is_none());
+        stream.flush().await.unwrap();
+        // TLS responses queued after DIRECT must not be sent on the raw wire.
+        stream.session.send_close_notify();
+        assert!(stream.plain_tcp().is_some());
+
+        for state in [
+            TlsState::ReadShutdown,
+            TlsState::WriteShutdown,
+            TlsState::FullyShutdown,
+        ] {
+            stream.state = state;
+            assert!(stream.plain_tcp().is_none());
+        }
+    }
+
+    fn ordinary_connections() -> (TlsConnection, TlsConnection) {
+        use std::sync::Arc;
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server =
+            TlsConnection::new(rustls::ServerConnection::new(Arc::new(server_config)).unwrap());
+        let client = TlsConnection::new(
+            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+                .unwrap(),
+        );
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn ordinary_tls_shutdown_drains_data_and_fatal_alert_after_backpressure() {
+        use std::io::Read;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for fail_server in [false, true] {
+            let (mut client, mut server) = ordinary_connections();
+            for _ in 0..8 {
+                let mut wire = Vec::new();
+                client.write_tls(&mut wire).unwrap();
+                server.feed(&wire).unwrap();
+                wire.clear();
+                server.write_tls(&mut wire).unwrap();
+                client.feed(&wire).unwrap();
+                if !client.is_handshaking() && !server.is_handshaking() && !client.wants_write() {
+                    break;
+                }
+            }
+            assert!(!client.is_handshaking() && !server.is_handshaking());
+            assert!(!client.wants_write() && !server.wants_write());
+            let (sender, mut receiver) = if fail_server {
+                (server, client)
+            } else {
+                (client, server)
+            };
+            let (io, mut peer) = tokio::io::duplex(16);
+            let mut stream = CryptoTlsStream::new(io, sender, None);
+            let payload = [42; 1000];
+            stream.write_all(&payload).await.unwrap();
+            assert!(stream.session.wants_write());
+            peer.write_all(&[23, 3, 3, 0, 1, 0]).await.unwrap();
+            assert_eq!(
+                stream.read(&mut [0]).await.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(stream.session.wants_write());
+
+            let mut wire = Vec::new();
+            let (shutdown, read) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    async move {
+                        let result = stream.shutdown().await;
+                        drop(stream);
+                        result
+                    },
+                    peer.read_to_end(&mut wire)
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(shutdown.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            read.unwrap();
+            let error = receiver.feed(&wire).unwrap_err();
+            assert!(error.to_string().contains("BadRecordMac"), "{error}");
+            let mut received = [0; 1000];
+            receiver.reader().read_exact(&mut received).unwrap();
+            assert_eq!(received, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_tls_roundtrip_with_partial_transport_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, server) = ordinary_connections();
+        let (client_io, server_io) = tokio::io::duplex(256);
+        let peer = tokio::spawn(async move {
+            let mut stream =
+                CryptoTlsStream::handshake(server_io, server, TlsReadMode::Stream, &[])
+                    .await
+                    .unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            received
+        });
+        let mut stream = CryptoTlsStream::handshake(client_io, client, TlsReadMode::Stream, &[])
+            .await
+            .unwrap();
+        assert!(stream.is_write_vectored());
+        assert_eq!(
+            stream
+                .write_vectored(&[io::IoSlice::new(b"")])
+                .await
+                .unwrap(),
+            0
+        );
+        let payload: Vec<u8> = (0..70000).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let mut slices = [
+            io::IoSlice::new(b""),
+            io::IoSlice::new(&payload[..9]),
+            io::IoSlice::new(&payload[9..40000]),
+            io::IoSlice::new(&payload[40000..]),
+        ];
+        let mut remaining = &mut slices[..];
+        while !remaining.is_empty() {
+            let written = stream.write_vectored(remaining).await.unwrap();
+            assert!(written > 0);
+            io::IoSlice::advance_slices(&mut remaining, written);
+        }
+        stream.shutdown().await.unwrap();
+        assert_eq!(peer.await.unwrap(), payload);
+        assert_eq!(
+            stream.write_vectored(&slices).await.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn vectored_reality_fallback_accounts_for_accepted_plaintext_under_backpressure() {
+        let mut stream = CryptoTlsStream::new(PendingWriteIo, completed_reality_connection(), None);
+        assert!(!stream.is_write_vectored());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let data = [7; 16384];
+        let slices = [
+            io::IoSlice::new(b""),
+            io::IoSlice::new(&data),
+            io::IoSlice::new(&data),
+        ];
+        let mut accepted = 0;
+        let mut blocked = false;
+        for _ in 0..16 {
+            match Pin::new(&mut stream).poll_write_vectored(&mut cx, &slices) {
+                Poll::Ready(Ok(n)) => {
+                    assert!(n > 0);
+                    accepted += n;
+                }
+                Poll::Pending => {
+                    blocked = true;
+                    break;
+                }
+                Poll::Ready(Err(error)) => panic!("unexpected error: {error}"),
+            }
+        }
+        assert!(blocked);
+        assert!(accepted > 0 && accepted <= 65536);
+    }
+
+    #[tokio::test]
+    async fn raw_vectors_follow_the_entire_encrypted_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (io, mut peer) = tokio::io::duplex(8);
+        let mut stream = CryptoTlsStream::new(io, completed_reality_connection(), None);
+        stream.start_raw_write(b"last encrypted bytes").unwrap();
+        let mut expected = stream.raw_write_prefix.as_ref().unwrap().to_vec();
+        expected.extend_from_slice(b"raw bytes");
+        let mut received = vec![0; expected.len()];
+        let slices = [io::IoSlice::new(b"raw "), io::IoSlice::new(b"bytes")];
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            Pin::new(&mut stream)
+                .poll_write_vectored(&mut cx, &slices)
+                .is_pending()
+        );
+        assert!(stream.is_write_vectored());
+        let send = async {
+            let mut slices = slices;
+            let mut remaining = &mut slices[..];
+            while !remaining.is_empty() {
+                let n = stream.write_vectored(remaining).await.unwrap();
+                assert!(n > 0);
+                io::IoSlice::advance_slices(&mut remaining, n);
+            }
+            stream.flush().await.unwrap();
         };
-        RealityServerConnection::new(config)
-            .unwrap()
-            .complete_for_test()
-            .unwrap()
+        let ((), read) = tokio::join!(send, peer.read_exact(&mut received));
+        read.unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn ordinary_preread_returns_to_backend_reads_at_a_record_boundary() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let payload = vec![42; 40_000];
+        for split in [0, 1, 4, 5, 10, 20_000, usize::MAX] {
+            let (mut sender, receiver) = crate::reality::established_pair();
+            sender.writer().write_all(&payload).unwrap();
+            let mut ciphertext = Vec::new();
+            sender.write_tls(&mut ciphertext).unwrap();
+            let split = split.min(ciphertext.len());
+            let (io, mut peer) = tokio::io::duplex(65536);
+            peer.write_all(&ciphertext[split..]).await.unwrap();
+            let mut stream =
+                CryptoTlsStream::handshake(io, receiver, TlsReadMode::Stream, &ciphertext[..split])
+                    .await
+                    .unwrap();
+            let mut received = vec![0; payload.len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, payload);
+            assert!(matches!(stream.input, TlsInput::Stream));
+        }
     }
 
     #[test]
     fn reality_stream_stops_accepting_plaintext_when_tls_output_is_blocked() {
-        let mut stream = CryptoTlsStream::new(
-            PendingWriteIo,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-        );
+        let mut stream = CryptoTlsStream::new(PendingWriteIo, completed_reality_connection(), None);
         let mut cx = Context::from_waker(noop_waker_ref());
         let data = [0u8; 16 * 1024];
         let mut accepted = 0;
@@ -570,10 +1015,7 @@ mod tests {
 
     #[test]
     fn reality_stream_rejects_write_zero_without_waiting_for_a_wake() {
-        let mut stream = CryptoTlsStream::new(
-            ZeroWriteIo,
-            CryptoConnection::new_reality_server(completed_reality_connection()),
-        );
+        let mut stream = CryptoTlsStream::new(ZeroWriteIo, completed_reality_connection(), None);
         let mut cx = Context::from_waker(noop_waker_ref());
 
         let result = Pin::new(&mut stream).poll_write(&mut cx, &[0; 1024]);

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use crate::address::ResolvedLocation;
 use crate::async_stream::AsyncMessageStream;
 use crate::async_stream::AsyncStream;
-use crate::crypto::{CryptoConnection, CryptoTlsStream, perform_crypto_handshake};
+use crate::crypto::{CryptoTlsStream, TlsConnection, TlsReadMode};
 use crate::tcp::tcp_handler::{TcpClientHandler, TcpClientSetupResult};
 
 #[derive(Debug)]
@@ -55,9 +55,32 @@ impl TlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for TlsClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => {
+                handler.prepare_target(target, resolver).await
+            }
+            TlsInnerClientHandler::VisionVless { .. } => Ok(target),
+        }
+    }
+
+    async fn try_reuse_tcp_stream(
+        &self,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        match &self.handler {
+            TlsInnerClientHandler::Default(handler) => handler.try_reuse_tcp_stream(target).await,
+            TlsInnerClientHandler::VisionVless { .. } => Ok(None),
+        }
+    }
+
     async fn setup_client_tcp_stream(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
         let mut client_conn =
@@ -73,12 +96,16 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let mut connection = CryptoConnection::new_rustls_client(client_conn);
-        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+        let connection = TlsConnection::new(client_conn);
+        let mode = match self.handler {
+            TlsInnerClientHandler::VisionVless { .. } => TlsReadMode::PreserveRecords,
+            TlsInnerClientHandler::Default(_) => TlsReadMode::Stream,
+        };
+        let tls_stream = CryptoTlsStream::handshake(client_stream, connection, mode, &[]).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
+                handler.validate_alpn(tls_stream.alpn_protocol())?;
                 handler
                     .setup_client_tcp_stream(Box::new(tls_stream), remote_location)
                     .await
@@ -103,7 +130,7 @@ impl TcpClientHandler for TlsClientHandler {
 
     async fn setup_client_udp_bidirectional(
         &self,
-        mut client_stream: Box<dyn AsyncStream>,
+        client_stream: Box<dyn AsyncStream>,
         target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
         let mut client_conn =
@@ -119,9 +146,9 @@ impl TcpClientHandler for TlsClientHandler {
             client_conn.set_buffer_limit(Some(size));
         }
 
-        let mut connection = CryptoConnection::new_rustls_client(client_conn);
-        perform_crypto_handshake(&mut connection, &mut client_stream, 16384).await?;
-        let tls_stream = CryptoTlsStream::new(client_stream, connection);
+        let connection = TlsConnection::new(client_conn);
+        let tls_stream =
+            CryptoTlsStream::handshake(client_stream, connection, TlsReadMode::Stream, &[]).await?;
 
         match &self.handler {
             TlsInnerClientHandler::Default(handler) => {
@@ -137,6 +164,141 @@ impl TcpClientHandler for TlsClientHandler {
                 )
                 .await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct RejectReuse;
+
+    #[async_trait]
+    impl TcpClientHandler for RejectReuse {
+        async fn prepare_target(
+            &self,
+            _: ResolvedLocation,
+            _: &Arc<dyn crate::resolver::Resolver>,
+        ) -> std::io::Result<ResolvedLocation> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target rejected",
+            ))
+        }
+
+        async fn try_reuse_tcp_stream(
+            &self,
+            _: &ResolvedLocation,
+        ) -> std::io::Result<Option<TcpClientSetupResult>> {
+            Err(std::io::Error::other("CONNECT rejected"))
+        }
+        async fn setup_client_tcp_stream(
+            &self,
+            _: Box<dyn AsyncStream>,
+            _: ResolvedLocation,
+        ) -> std::io::Result<TcpClientSetupResult> {
+            panic!("reuse must not acquire a new transport")
+        }
+    }
+
+    #[tokio::test]
+    async fn only_default_tls_and_reality_handlers_forward_reuse() {
+        use crate::reality::RealityClientHandler;
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let target = crate::address::NetLocation::from_str("example.com:443", None)
+            .unwrap()
+            .into();
+        let defaults: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(TlsClientHandler::new(
+                config.clone(),
+                None,
+                "localhost".try_into().unwrap(),
+                Box::new(RejectReuse),
+            )),
+            Box::new(RealityClientHandler::new(
+                [0; 32],
+                [0; 8],
+                "localhost".try_into().unwrap(),
+                vec![],
+                Box::new(RejectReuse),
+            )),
+        ];
+        let resolver: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::NativeResolver::new());
+        for handler in &defaults {
+            assert_eq!(
+                handler
+                    .try_reuse_tcp_stream(&target)
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "CONNECT rejected"
+            );
+        }
+        let wrappers: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(crate::websocket::WebsocketTcpClientHandler::new(
+                None,
+                None,
+                Default::default(),
+                Box::new(RejectReuse),
+            )),
+            Box::new(crate::shadow_tls::ShadowTlsClientHandler::new(
+                "password".into(),
+                config.clone(),
+                "localhost".try_into().unwrap(),
+                Box::new(RejectReuse),
+            )),
+        ];
+        for handler in defaults.into_iter().chain(wrappers) {
+            assert_eq!(
+                handler
+                    .prepare_target(target.clone(), &resolver)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+        let vision: Vec<Box<dyn TcpClientHandler>> = vec![
+            Box::new(TlsClientHandler::new_vision_vless(
+                config,
+                None,
+                "localhost".try_into().unwrap(),
+                Box::new([0; 16]),
+                false,
+            )),
+            Box::new(RealityClientHandler::new_vision_vless(
+                [0; 32],
+                [0; 8],
+                "localhost".try_into().unwrap(),
+                vec![],
+                Box::new([0; 16]),
+                false,
+            )),
+        ];
+        for handler in vision {
+            assert_eq!(
+                handler
+                    .prepare_target(target.clone(), &resolver)
+                    .await
+                    .unwrap()
+                    .location(),
+                target.location()
+            );
+            assert!(
+                handler
+                    .try_reuse_tcp_stream(&target)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 }

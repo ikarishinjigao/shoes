@@ -9,22 +9,22 @@ use crate::anytls::{AnyTlsServerHandler, PaddingFactory};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::{ClientChainHop, ClientConfig};
 use crate::config::{
-    ConfigSelection, RealityServerConfig, ServerProxyConfig, ShadowTlsServerConfig,
+    ConfigSelection, RealityServerConfig, RuleConfig, ServerProxyConfig, ShadowTlsServerConfig,
     ShadowTlsServerHandshakeConfig, ShadowsocksConfig, TlsServerConfig, WebsocketServerConfig,
 };
 use crate::http_handler::HttpTcpServerHandler;
 use crate::mixed_handler::MixedTcpServerHandler;
 use crate::naiveproxy::UserLookup;
-use crate::option_util::OneOrSome;
+use crate::option_util::{NoneOrSome, OneOrSome};
 use crate::port_forward_handler::PortForwardServerHandler;
 use crate::reality::RealityServerTarget;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_server_config;
+use crate::rustls_config_util::try_create_server_config;
 use crate::shadow_tls::{ShadowTlsServerTarget, ShadowTlsServerTargetHandshake};
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellServerHandler;
 use crate::socks_handler::SocksTcpServerHandler;
-use crate::tcp::chain_builder::build_client_proxy_chain;
+use crate::tcp::chain_builder::try_build_client_proxy_chain;
 use crate::tcp::tcp_handler::TcpServerHandler;
 use crate::tls_server_handler::NaiveConfig;
 use crate::tls_server_handler::{
@@ -38,6 +38,28 @@ use crate::websocket::{WebsocketServerTarget, WebsocketTcpServerHandler};
 
 use super::tcp_client_handler_factory::create_tcp_client_proxy_selector;
 
+#[derive(Default)]
+pub(crate) struct HandlerServices {
+    xhttp: std::collections::HashMap<Vec<String>, crate::xhttp::XhttpServer>,
+    vless: std::collections::HashMap<Vec<String>, Arc<crate::vless::encryption::ServerEncryption>>,
+}
+
+struct ServiceScope<'a> {
+    services: &'a mut HandlerServices,
+    path: Vec<String>,
+}
+
+impl ServiceScope<'_> {
+    fn child(&mut self, key: String) -> ServiceScope<'_> {
+        let mut path = self.path.clone();
+        path.push(key);
+        ServiceScope {
+            services: self.services,
+            path,
+        }
+    }
+}
+
 fn create_auth_credentials(
     username: Option<String>,
     password: Option<String>,
@@ -46,6 +68,20 @@ fn create_auth_credentials(
         (None, None) => None,
         _ => Some((username.unwrap_or_default(), password.unwrap_or_default())),
     }
+}
+
+fn create_override_selector(
+    override_rules: NoneOrSome<ConfigSelection<RuleConfig>>,
+    parent: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+) -> std::io::Result<Arc<ClientProxySelector>> {
+    let rules = override_rules
+        .map(ConfigSelection::unwrap_config)
+        .into_vec();
+    Ok(Arc::new(
+        create_tcp_client_proxy_selector(rules, resolver.clone())?
+            .inherit_inbound_policy(parent)?,
+    ))
 }
 
 /// Create a TCP server handler from config.
@@ -64,11 +100,56 @@ pub fn create_tcp_server_handler(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> Box<dyn TcpServerHandler> {
-    match server_proxy_config {
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    create_tcp_server_handler_shared(
+        server_proxy_config,
+        client_proxy_selector,
+        resolver,
+        bind_ip,
+        &mut HandlerServices::default(),
+    )
+}
+
+pub(crate) fn create_tcp_server_handler_shared(
+    config: ServerProxyConfig,
+    selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    services: &mut HandlerServices,
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    create_handler(
+        config,
+        selector,
+        resolver,
+        bind_ip,
+        &mut ServiceScope {
+            services,
+            path: Vec::new(),
+        },
+    )
+}
+
+fn create_handler(
+    server_proxy_config: ServerProxyConfig,
+    client_proxy_selector: &Arc<ClientProxySelector>,
+    resolver: &Arc<dyn Resolver>,
+    bind_ip: Option<IpAddr>,
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<Box<dyn TcpServerHandler>> {
+    Ok(match server_proxy_config {
+        ServerProxyConfig::Xhttp(config) => {
+            let service = match scope.services.xhttp.entry(scope.path.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    crate::xhttp::XhttpServer::new(config, client_proxy_selector, resolver, None)?,
+                ),
+            };
+            Box::new(service.clone())
+        }
         ServerProxyConfig::Http { username, password } => Box::new(HttpTcpServerHandler::new(
             create_auth_credentials(username, password),
             client_proxy_selector.clone(),
+            resolver.clone(),
         )),
         ServerProxyConfig::Socks {
             username,
@@ -138,13 +219,41 @@ pub fn create_tcp_server_handler(
             user_id,
             udp_enabled,
             fallback,
-        } => Box::new(VlessTcpServerHandler::new(
-            &user_id,
-            udp_enabled,
-            client_proxy_selector.clone(),
-            resolver.clone(),
-            fallback,
-        )),
+            decryption,
+            vision,
+            encryption_limits,
+            ..
+        } => {
+            let encryption = if decryption.is_disabled() {
+                if encryption_limits.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "VLESS encryption_limits requires native decryption",
+                    ));
+                }
+                None
+            } else {
+                let service = match scope.services.vless.entry(scope.path.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Arc::new(crate::vless::encryption::ServerEncryption::new(
+                            decryption.as_str(),
+                            encryption_limits.unwrap_or_default(),
+                        )?))
+                    }
+                };
+                Some(service.clone())
+            };
+            Box::new(VlessTcpServerHandler::new(
+                &user_id,
+                udp_enabled,
+                client_proxy_selector.clone(),
+                resolver.clone(),
+                fallback,
+                encryption,
+                vision,
+            )?)
+        }
         ServerProxyConfig::Trojan {
             password,
             shadowsocks,
@@ -164,44 +273,60 @@ pub fn create_tcp_server_handler(
             let mut all_targets = tls_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
-                        sni,
-                        create_tls_server_target(config, client_proxy_selector, resolver, bind_ip),
+                    Ok((
+                        sni.clone(),
+                        create_tls_server_target(
+                            config,
+                            client_proxy_selector,
+                            resolver,
+                            bind_ip,
+                            &mut scope.child(format!("tls:{sni}")),
+                        )?,
+                    ))
+                })
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
+            let default_tls_target = default_tls_target
+                .map(|config| {
+                    create_tls_server_target(
+                        *config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child("default".into()),
                     )
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
-            let default_tls_target = default_tls_target.map(|config| {
-                create_tls_server_target(*config, client_proxy_selector, resolver, bind_ip)
-            });
+                .transpose()?;
             let shadowtls_targets = shadowtls_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
-                        sni,
+                    Ok((
+                        sni.clone(),
                         create_shadow_tls_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
-                        ),
-                    )
+                            &mut scope.child(format!("shadowtls:{sni}")),
+                        )?,
+                    ))
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
             all_targets.extend(shadowtls_targets);
             let reality_server_targets = reality_targets
                 .into_iter()
                 .map(|(sni, config)| {
-                    (
-                        sni,
+                    Ok((
+                        sni.clone(),
                         create_reality_server_target(
                             config,
                             client_proxy_selector,
                             resolver,
                             bind_ip,
-                        ),
-                    )
+                            &mut scope.child(format!("reality:{sni}")),
+                        )?,
+                    ))
                 })
-                .collect::<FxHashMap<String, TlsServerTarget>>();
+                .collect::<std::io::Result<FxHashMap<String, TlsServerTarget>>>()?;
             all_targets.extend(reality_server_targets);
             Box::new(TlsServerHandler::new(
                 all_targets,
@@ -220,15 +345,22 @@ pub fn create_tcp_server_handler(
             udp_enabled,
             client_proxy_selector.clone(),
             resolver.clone(),
-        )),
+        )?),
         ServerProxyConfig::Websocket { targets } => {
             let server_targets: Vec<WebsocketServerTarget> = targets
                 .into_vec()
                 .into_iter()
-                .map(|config| {
-                    create_websocket_server_target(config, client_proxy_selector, resolver, bind_ip)
+                .enumerate()
+                .map(|(index, config)| {
+                    create_websocket_server_target(
+                        config,
+                        client_proxy_selector,
+                        resolver,
+                        bind_ip,
+                        &mut scope.child(format!("ws:{index}")),
+                    )
                 })
-                .collect::<Vec<_>>();
+                .collect::<std::io::Result<Vec<_>>>()?;
             Box::new(WebsocketTcpServerHandler::new(server_targets))
         }
         ServerProxyConfig::PortForward { targets } => {
@@ -252,15 +384,12 @@ pub fn create_tcp_server_handler(
 
             let padding = if let Some(scheme_lines) = padding_scheme {
                 let scheme_str = scheme_lines.join("\n");
-                Arc::new(
-                    PaddingFactory::new(scheme_str.as_bytes())
-                        .expect("Invalid padding scheme (should be validated during config load)"),
-                )
+                Arc::new(PaddingFactory::new(scheme_str.as_bytes()).map_err(std::io::Error::other)?)
             } else {
                 PaddingFactory::default_factory()
             };
 
-            // AnyTLS spawns its own task and returns AlreadyHandled, so it needs the proxy
+            // AnyTLS handles its logical streams internally, so it needs the proxy
             // provider directly (it won't inherit from outer handler through TcpForward)
             Box::new(AnyTlsServerHandler::new(
                 users,
@@ -272,16 +401,40 @@ pub fn create_tcp_server_handler(
             ))
         }
         ServerProxyConfig::Naiveproxy { .. } => {
-            // This should be caught at config validation time
-            unreachable!(
-                "NaiveProxy must be used inside a TLS or Reality protocol - \
-                 config validation should have rejected this"
-            )
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "NaiveProxy must be used inside a TLS or Reality protocol",
+            ));
         }
         unknown_config => {
-            panic!("Unsupported TCP proxy config: {unknown_config:?}")
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Unsupported TCP proxy protocol: {unknown_config}"),
+            ));
         }
-    }
+    })
+}
+
+fn create_vision_vless_config(protocol: &ServerProxyConfig) -> std::io::Result<VisionVlessConfig> {
+    crate::config::validate_server_vision(true, protocol)?;
+    let ServerProxyConfig::Vless {
+        user_id,
+        udp_enabled,
+        fallback,
+        ..
+    } = protocol
+    else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    };
+
+    Ok(VisionVlessConfig {
+        user_id: parse_uuid(user_id)?.into_boxed_slice(),
+        udp_enabled: *udp_enabled,
+        fallback: fallback.clone(),
+    })
 }
 
 fn create_tls_server_target(
@@ -289,8 +442,12 @@ fn create_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<TlsServerTarget> {
     let TlsServerConfig {
+        certificate_source: _,
+        certificate_binding,
+        key_exchange_groups,
         cert,
         key,
         alpn_protocols,
@@ -300,6 +457,14 @@ fn create_tls_server_target(
         protocol,
         override_rules,
     } = tls_server_config;
+    key_exchange_groups.validate_vision(vision)?;
+
+    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    }
 
     // Certificates are already embedded as PEM data during config validation
     let cert_bytes = cert.as_bytes().to_vec();
@@ -322,24 +487,26 @@ fn create_tls_server_target(
             );
         }
         naive_alpn
+    } else if let ServerProxyConfig::Xhttp(config) = &protocol {
+        config.tls_alpn(&alpn_protocols)?
     } else {
         alpn_protocols.into_vec()
     };
 
-    let server_config = Arc::new(create_server_config(
-        &cert_bytes,
-        &key_bytes,
-        client_ca_certs,
-        &effective_alpn,
-        &client_fingerprints.into_vec(),
-    ));
+    let server_config = Arc::new(
+        crate::rustls_config_util::try_create_server_config_with_source(
+            &cert_bytes,
+            &key_bytes,
+            client_ca_certs,
+            &effective_alpn,
+            &client_fingerprints.into_vec(),
+            &key_exchange_groups,
+            certificate_binding.as_ref(),
+        )?,
+    );
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -366,34 +533,18 @@ fn create_tls_server_target(
             padding_enabled: padding,
         })
     } else if vision {
-        // Vision requires VLESS protocol (validated in config/mod.rs)
-        if let ServerProxyConfig::Vless {
-            user_id,
-            udp_enabled,
-            fallback,
-        } = &protocol
-        {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
-            InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
-                udp_enabled: *udp_enabled,
-                fallback: fallback.clone(),
-            })
-        } else {
-            unreachable!("Vision requires VLESS (should be validated during config load)")
-        }
+        InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
         InnerProtocol::Normal(handler)
     };
 
-    TlsServerTarget::Tls {
+    Ok(TlsServerTarget::Tls {
+        certificate_source: certificate_binding,
         server_config,
         effective_selector,
         inner_protocol,
-    }
+    })
 }
 
 fn create_shadow_tls_server_target(
@@ -401,7 +552,8 @@ fn create_shadow_tls_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<TlsServerTarget> {
     let ShadowTlsServerConfig {
         password,
         handshake,
@@ -421,41 +573,39 @@ fn create_shadow_tls_server_target(
                 .map(|cert| cert.as_bytes().to_vec())
                 .collect();
 
-            let server_config = Arc::new(create_server_config(
+            let server_config = Arc::new(try_create_server_config(
                 &cert_bytes,
                 &key_bytes,
                 client_ca_certs,
                 &handshake.alpn_protocols.into_vec(),
                 &handshake.client_fingerprints.into_vec(),
-            ));
+                &Default::default(),
+            )?);
 
             ShadowTlsServerTargetHandshake::new_local(server_config)
         }
         ShadowTlsServerHandshakeConfig::Remote(handshake) => {
             // Build ClientProxyChain from client_chain
             // client_chain is guaranteed to be non-empty (defaults to direct hop)
-            let client_chain = build_client_proxy_chain(handshake.client_chain, resolver.clone());
+            let client_chain =
+                try_build_client_proxy_chain(handshake.client_chain, resolver.clone())?;
             ShadowTlsServerTargetHandshake::new_remote(handshake.address, client_chain)
         }
     };
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
 
-    TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
+    Ok(TlsServerTarget::ShadowTls(ShadowTlsServerTarget::new(
         password,
         target_handshake,
         handler,
-    ))
+    )))
 }
 
 fn create_reality_server_target(
@@ -463,8 +613,10 @@ fn create_reality_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> TlsServerTarget {
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<TlsServerTarget> {
     let RealityServerConfig {
+        mldsa65_seed,
         private_key,
         short_ids,
         dest,
@@ -478,27 +630,26 @@ fn create_reality_server_target(
         override_rules,
     } = reality_server_config;
 
+    if vision && !matches!(protocol, ServerProxyConfig::Vless { .. }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Vision requires VLESS",
+        ));
+    }
+
     // Decode private key from base64url (validated during config load)
-    let private_key_bytes = crate::reality::decode_private_key(&private_key)
-        .expect("Invalid REALITY private key (should be validated during config load)");
+    let private_key_bytes = crate::reality::decode_private_key(&private_key)?;
 
     // Decode short IDs from hex strings (validated during config load)
     // OneOrSome ensures at least one short_id is always present (default is all zeros)
     let short_id_bytes: Vec<[u8; 8]> = short_ids
         .into_vec()
         .into_iter()
-        .map(|s| {
-            crate::reality::decode_short_id(&s)
-                .expect("Invalid REALITY short_id (should be validated during config load)")
-        })
-        .collect();
+        .map(|s| crate::reality::decode_short_id(&s))
+        .collect::<std::io::Result<_>>()?;
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
@@ -525,26 +676,9 @@ fn create_reality_server_target(
             padding_enabled: padding,
         })
     } else if vision {
-        // Vision requires VLESS protocol (validated in config/mod.rs)
-        if let ServerProxyConfig::Vless {
-            user_id,
-            udp_enabled,
-            fallback,
-        } = &protocol
-        {
-            let user_id_bytes = parse_uuid(user_id)
-                .expect("Invalid user_id UUID")
-                .into_boxed_slice();
-            InnerProtocol::VisionVless(VisionVlessConfig {
-                user_id: user_id_bytes,
-                udp_enabled: *udp_enabled,
-                fallback: fallback.clone(),
-            })
-        } else {
-            unreachable!("Vision requires VLESS (should be validated during config load)")
-        }
+        InnerProtocol::VisionVless(create_vision_vless_config(&protocol)?)
     } else {
-        let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+        let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
         InnerProtocol::Normal(handler)
     };
 
@@ -553,23 +687,22 @@ fn create_reality_server_target(
         let hops = dest_client_chain.into_vec();
         if hops.is_empty() {
             // Default to direct connection
-            build_client_proxy_chain(
+            try_build_client_proxy_chain(
                 OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                     ClientConfig::default(),
                 ))),
                 resolver.clone(),
             )
-        } else if hops.len() == 1 {
-            build_client_proxy_chain(
-                OneOrSome::One(hops.into_iter().next().unwrap()),
-                resolver.clone(),
-            )
         } else {
-            build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
+            try_build_client_proxy_chain(OneOrSome::Some(hops), resolver.clone())
         }
-    };
+    }?;
 
-    TlsServerTarget::Reality(RealityServerTarget {
+    Ok(TlsServerTarget::Reality(RealityServerTarget {
+        mldsa65_key: mldsa65_seed
+            .as_deref()
+            .map(crate::reality::mldsa65_signing_key)
+            .transpose()?,
         private_key: private_key_bytes,
         short_ids: short_id_bytes,
         dest,
@@ -580,7 +713,7 @@ fn create_reality_server_target(
         effective_selector,
         inner_protocol,
         dest_client_chain,
-    })
+    }))
 }
 
 fn create_websocket_server_target(
@@ -588,7 +721,8 @@ fn create_websocket_server_target(
     client_proxy_selector: &Arc<ClientProxySelector>,
     resolver: &Arc<dyn Resolver>,
     bind_ip: Option<IpAddr>,
-) -> WebsocketServerTarget {
+    scope: &mut ServiceScope<'_>,
+) -> std::io::Result<WebsocketServerTarget> {
     let WebsocketServerConfig {
         matching_path,
         matching_headers,
@@ -606,22 +740,198 @@ fn create_websocket_server_target(
             .collect::<FxHashMap<_, _>>()
     });
 
-    // Compute effective selector: if override_rules exist, create new selector; otherwise use parent's
     let effective_selector = if !override_rules.is_empty() {
-        let rules = override_rules
-            .map(ConfigSelection::unwrap_config)
-            .into_vec();
-        Arc::new(create_tcp_client_proxy_selector(rules, resolver.clone()))
+        create_override_selector(override_rules, client_proxy_selector, resolver)?
     } else {
         client_proxy_selector.clone()
     };
 
-    let handler = create_tcp_server_handler(protocol, &effective_selector, resolver, bind_ip);
+    let handler = create_handler(protocol, &effective_selector, resolver, bind_ip, scope)?;
 
-    WebsocketServerTarget {
+    Ok(WebsocketServerTarget {
         matching_path,
         matching_headers,
         ping_type,
         handler,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn override_selectors_inherit_context_and_sniff_but_keep_their_own_rules() {
+        use crate::address::{NetLocation, NetLocationMask};
+        use crate::client_proxy_selector::IngressTarget;
+        use crate::config::RuleActionConfig;
+        use crate::dns::fake_ip::FakeDnsContext;
+
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let context = Arc::new(FakeDnsContext::new(Default::default(), resolver.clone()).unwrap());
+        let parent = Arc::new(
+            ClientProxySelector::new(vec![])
+                .with_sniff(true)
+                .with_fake_dns_context(Some(context.clone()))
+                .unwrap(),
+        );
+        for (mask, should_sniff) in [("0.0.0.0/0", false), ("child.example", true)] {
+            let mut rule = RuleConfig {
+                criteria: crate::config::rules::RuleCriteria {
+                    expression: crate::rules::Expression::Legacy(OneOrSome::One(
+                        NetLocationMask::from(mask).unwrap(),
+                    )),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            rule.compile(&mut crate::rules::Compiler::default())
+                .unwrap();
+            let rules = NoneOrSome::One(ConfigSelection::Config(rule));
+            let child = create_override_selector(rules, &parent, &resolver).unwrap();
+            assert!(!Arc::ptr_eq(&child, &parent));
+            let IngressTarget::LocalDns {
+                context: inherited, ..
+            } = child
+                .prepare(NetLocation::from_str("198.18.0.9:53", None).unwrap().into())
+                .unwrap()
+            else {
+                panic!("DNS was not intercepted");
+            };
+            assert!(Arc::ptr_eq(&inherited, &context));
+            let IngressTarget::Forward(target) = child
+                .prepare(
+                    NetLocation::from_str("203.0.113.7:443", None)
+                        .unwrap()
+                        .into(),
+                )
+                .unwrap()
+            else {
+                panic!("not a forward target");
+            };
+            assert_eq!(child.should_sniff(&target), should_sniff);
+        }
+
+        let mut rule = RuleConfig::default();
+        let RuleActionConfig::Allow {
+            override_address, ..
+        } = &mut rule.action
+        else {
+            panic!("default rule is not Allow");
+        };
+        *override_address = Some(NetLocation::from_str("198.18.0.9:53", None).unwrap());
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
+        let error = create_override_selector(
+            NoneOrSome::One(ConfigSelection::Config(rule)),
+            &parent,
+            &resolver,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "synthetic address cannot be an outbound target"
+        );
+    }
+
+    #[test]
+    fn native_vless_services_share_only_within_one_generation_and_protocol_path() {
+        let selector = Arc::new(ClientProxySelector::new(vec![]));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let config: ServerProxyConfig = serde_json::from_value(json!({
+            "type": "vless", "user_id": "550e8400-e29b-41d4-a716-446655440000",
+            "decryption": "mlkem768x25519plus.native.600s.CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        })).unwrap();
+        let mut services = HandlerServices::default();
+        let first = create_tcp_server_handler_shared(
+            config.clone(),
+            &selector,
+            &resolver,
+            Some("127.0.0.1".parse().unwrap()),
+            &mut services,
+        )
+        .unwrap();
+        let session = services.vless[&Vec::new()].clone();
+        let second = create_tcp_server_handler_shared(
+            config.clone(),
+            &selector,
+            &resolver,
+            Some("127.0.0.2".parse().unwrap()),
+            &mut services,
+        )
+        .unwrap();
+        assert_eq!(services.vless.len(), 1);
+        assert!(Arc::ptr_eq(&session, &services.vless[&Vec::new()]));
+        assert_eq!(Arc::strong_count(&session), 4);
+        let scoped = create_handler(
+            config.clone(),
+            &selector,
+            &resolver,
+            None,
+            &mut ServiceScope {
+                services: &mut services,
+                path: vec!["other-target".into()],
+            },
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(
+            &session,
+            &services.vless[&vec!["other-target".into()]]
+        ));
+        let mut next_generation = HandlerServices::default();
+        let next = create_tcp_server_handler_shared(
+            config,
+            &selector,
+            &resolver,
+            None,
+            &mut next_generation,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&session, &next_generation.vless[&Vec::new()]));
+        drop((first, second, scoped, next, services, next_generation));
+        assert_eq!(Arc::strong_count(&session), 1);
+    }
+
+    #[test]
+    fn unsupported_protocols_return_errors_without_credentials() {
+        let selector = Arc::new(ClientProxySelector::new(vec![]));
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        for (value, expected_kind, expected_message) in [
+            (
+                json!({"type": "hysteria2", "password": "do-not-log"}),
+                ErrorKind::Unsupported,
+                "Unsupported TCP proxy protocol: Hysteria2",
+            ),
+            (
+                json!({"type": "tuic", "uuid": "550e8400-e29b-41d4-a716-446655440000", "password": "do-not-log"}),
+                ErrorKind::Unsupported,
+                "Unsupported TCP proxy protocol: TuicV5",
+            ),
+            (
+                json!({"type": "naive", "users": [{"username": "user", "password": "do-not-log"}]}),
+                ErrorKind::InvalidInput,
+                "NaiveProxy must be used inside a TLS or Reality protocol",
+            ),
+            (
+                json!({"type": "tls", "default_target": {"cert": "unused", "key": "unused", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}),
+                ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ),
+            (
+                json!({"type": "tls", "reality_targets": {"localhost": {"private_key": "unused", "dest": "localhost:443", "vision": true, "protocol": {"type": "trojan", "password": "do-not-log"}}}}),
+                ErrorKind::InvalidInput,
+                "Vision requires VLESS",
+            ),
+        ] {
+            let protocol = serde_json::from_value(value).unwrap();
+            let error =
+                create_tcp_server_handler(protocol, &selector, &resolver, None).unwrap_err();
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.to_string(), expected_message);
+            assert!(!error.to_string().contains("do-not-log"));
+        }
     }
 }

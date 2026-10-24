@@ -11,46 +11,91 @@ use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use crate::tcp::socket_connector::SocketConnector;
 use crate::tcp::socket_connector_impl::SocketConnectorImpl;
 
+/// Checks the final hop without creating sockets or resolving addresses.
+pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::io::Result<bool> {
+    let Some(hop) = chain.hops.iter().last() else {
+        return Ok(false);
+    };
+    let selections: Box<dyn Iterator<Item = &ConfigSelection<ClientConfig>>> = match hop {
+        ClientChainHop::Single(selection) => Box::new(std::iter::once(selection)),
+        ClientChainHop::Pool(selections) => selections.iter(),
+    };
+    let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+    let mut supports_udp = false;
+    for selection in selections {
+        let ConfigSelection::Config(config) = selection else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Client chain groups must be expanded before checking UDP capability",
+            ));
+        };
+        supports_udp |= config.protocol.is_direct()
+            || config.protocol.is_wireguard()
+            || ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
+                .is_some_and(|proxy| proxy.supports_udp_over_tcp());
+    }
+    Ok(supports_udp)
+}
+
 /// Build a ClientProxyChain from a client_chain configuration.
 ///
 /// Creates InitialHopEntry (socket + optional proxy paired) from hop 0.
 /// Creates ProxyConnectors for subsequent hops (1+).
 /// `protocol: direct` at hop 0 creates InitialHopEntry::Direct.
+#[cfg(test)]
 pub fn build_client_proxy_chain(
     client_chain: crate::option_util::OneOrSome<ClientChainHop>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientProxyChain {
+    try_build_client_proxy_chain(client_chain, resolver).expect("Failed to create client chain")
+}
+
+pub fn try_build_client_proxy_chain(
+    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientProxyChain> {
+    build_client_proxy_chain_with_limits(client_chain, resolver, crate::resources::limits())
+}
+
+pub(crate) fn build_client_proxy_chain_with_limits(
+    client_chain: crate::option_util::OneOrSome<ClientChainHop>,
+    resolver: Arc<dyn Resolver>,
+    limits: crate::config::GlobalLimits,
+) -> std::io::Result<ClientProxyChain> {
     let hops: Vec<Vec<ClientConfig>> = client_chain
         .into_vec()
         .into_iter()
-        .map(|hop| match hop {
-            ClientChainHop::Single(selection) => match selection {
-                ConfigSelection::Config(config) => vec![config],
-                ConfigSelection::GroupName(group_name) => {
-                    panic!(
-                        "Group reference '{}' was not resolved during config validation.",
-                        group_name
-                    );
-                }
-            },
-            ClientChainHop::Pool(selections) => selections
-                .into_vec()
+        .map(|hop| {
+            let selections = match hop {
+                ClientChainHop::Single(selection) => vec![selection],
+                ClientChainHop::Pool(selections) => selections.into_vec(),
+            };
+            selections
                 .into_iter()
-                .flat_map(|selection| match selection {
-                    ConfigSelection::Config(config) => vec![config],
-                    ConfigSelection::GroupName(group_name) => {
-                        panic!(
-                            "Group reference '{}' was not resolved during config validation.",
-                            group_name
-                        );
-                    }
+                .map(|selection| match selection {
+                    ConfigSelection::Config(config) => Ok(config),
+                    ConfigSelection::GroupName(group_name) => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Group reference '{group_name}' was not resolved during config validation."
+                        ),
+                    )),
                 })
-                .collect(),
+                .collect::<std::io::Result<_>>()
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     if hops.is_empty() {
-        panic!("Client chain must have at least one hop");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Client chain must have at least one hop",
+        ));
+    }
+
+    for (index, configs) in hops.iter().enumerate() {
+        for config in configs {
+            config.validate_quic_key_exchange(index == 0)?;
+        }
     }
 
     // Build initial hop entries from hop 0.
@@ -58,27 +103,44 @@ pub fn build_client_proxy_chain(
     let initial_hop: Vec<InitialHopEntry> = hops[0]
         .iter()
         .map(|config| {
+            if let crate::config::ClientProxyConfig::Wireguard(reference) = &config.protocol {
+                let connector = reference.connector.clone().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "WireGuard endpoint registry has not been prepared",
+                    )
+                })?;
+                return Ok(InitialHopEntry::Wireguard(connector));
+            }
             // Find the first proxy address for QUIC socket configuration
             let target_address = find_first_proxy_address(&hops, config);
 
-            let socket = SocketConnectorImpl::from_config(config, target_address)
-                .map(|s| Box::new(s) as Box<dyn SocketConnector>)
-                .expect("Failed to create SocketConnector");
+            let socket =
+                SocketConnectorImpl::from_config_with_limits(config, target_address, limits)
+                    .map(|s| Arc::new(s) as Arc<dyn SocketConnector>)?;
 
             if config.protocol.is_direct() {
                 // Direct: socket only, no proxy
-                InitialHopEntry::Direct(socket)
+                Ok(InitialHopEntry::Direct(socket))
             } else {
                 // Proxy: socket + proxy paired
-                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())
+                let proxy = ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
                     .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
-                    .expect("Failed to create ProxyConnector for non-direct config");
-                InitialHopEntry::Proxy { socket, proxy }
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "Missing proxy connector for non-direct configuration",
+                        )
+                    })?;
+                Ok(InitialHopEntry::Proxy { socket, proxy })
             }
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
     // Build proxy connectors for subsequent hops (1+)
+    let origins = hops
+        .iter()
+        .map(|pool| pool.iter().map(|client| client.control.clone()).collect())
+        .collect();
     let subsequent_hops: Vec<Vec<Box<dyn ProxyConnector>>> = hops
         .into_iter()
         .skip(1) // Skip hop 0, already processed as initial_hop
@@ -88,24 +150,29 @@ pub fn build_client_proxy_chain(
             hop_configs
                 .into_iter()
                 .map(|config| {
+                    if config.transport == crate::config::Transport::Quic && crate::xhttp::connector::contains(&config.protocol) {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "XHTTP H3 is only supported at hop 0"));
+                    }
                     // Subsequent hops MUST NOT have direct protocol
                     if config.protocol.is_direct() {
-                        panic!(
-                            "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
-                            hop_index,
-                            config.address
-                        );
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "protocol: direct is only valid at hop 0. Found direct at hop {} with address {}",
+                                hop_index, config.address
+                            ),
+                        ));
                     }
 
-                    ProxyConnectorImpl::from_config(config, resolver.clone())
+                    ProxyConnectorImpl::from_config(config, resolver.clone())?
                         .map(|p| Box::new(p) as Box<dyn ProxyConnector>)
-                        .expect("Failed to create ProxyConnector for subsequent hop")
+                        .ok_or_else(|| std::io::Error::other("Missing proxy connector for subsequent hop"))
                 })
-                .collect()
+                .collect::<std::io::Result<_>>()
         })
-        .collect();
+        .collect::<std::io::Result<_>>()?;
 
-    ClientProxyChain::new(initial_hop, subsequent_hops)
+    Ok(ClientProxyChain::new(initial_hop, subsequent_hops).with_origins(origins))
 }
 
 /// Find the first proxy address in the chain (for socket connector target).
@@ -141,22 +208,39 @@ pub fn build_client_chain_group(
     client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
     resolver: Arc<dyn Resolver>,
 ) -> ClientChainGroup {
+    try_build_client_chain_group(client_chains, resolver)
+        .expect("Failed to create client chain group")
+}
+
+pub fn try_build_client_chain_group(
+    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientChainGroup> {
+    build_client_chain_group_with_limits(client_chains, resolver, crate::resources::limits())
+}
+
+pub fn build_client_chain_group_with_limits(
+    client_chains: crate::option_util::NoneOrSome<crate::config::ClientChain>,
+    resolver: Arc<dyn Resolver>,
+    limits: crate::config::GlobalLimits,
+) -> std::io::Result<ClientChainGroup> {
     let chains: Vec<ClientProxyChain> = if client_chains.is_empty() {
-        vec![build_client_proxy_chain(
+        vec![build_client_proxy_chain_with_limits(
             crate::option_util::OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
                 ClientConfig::default(),
             ))),
             resolver,
-        )]
+            limits,
+        )?]
     } else {
         client_chains
             .into_vec()
             .into_iter()
-            .map(|chain| build_client_proxy_chain(chain.hops, resolver.clone()))
-            .collect()
+            .map(|chain| build_client_proxy_chain_with_limits(chain.hops, resolver.clone(), limits))
+            .collect::<std::io::Result<_>>()?
     };
 
-    ClientChainGroup::new(chains)
+    Ok(ClientChainGroup::new(chains))
 }
 
 #[cfg(test)]
@@ -167,6 +251,17 @@ mod tests {
     use crate::option_util::{NoneOrSome, OneOrSome};
     use crate::resolver::NativeResolver;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn socket_initialization_failure_is_returned() {
+        let config: ClientConfig = serde_yaml::from_str("address: '127.0.0.1:443'\ntransport: quic\nbind_interface: shoes-missing-interface\nprotocol: {type: socks}\n").unwrap();
+        let result = try_build_client_proxy_chain(
+            OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(config))),
+            mock_resolver(),
+        );
+        assert!(result.is_err());
+    }
 
     fn mock_resolver() -> Arc<dyn Resolver> {
         Arc::new(NativeResolver::new())
@@ -185,6 +280,89 @@ mod tests {
 
     fn direct_config() -> ClientConfig {
         ClientConfig::default()
+    }
+
+    #[test]
+    fn offline_udp_capability_matches_wrappers_pools_and_runtime_handlers() {
+        for (protocol, expected) in [
+            ("{type: direct}", true),
+            ("{type: socks}", false),
+            ("{type: trojan, password: test}", false),
+            ("{type: trojan, password: test, h2mux: {}}", true),
+            (
+                "{type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0, udp_enabled: false}",
+                false,
+            ),
+            (
+                "{type: websocket, protocol: {type: vless, user_id: b85798ef-e9dc-46a4-9a87-8da4499d36d0}}",
+                true,
+            ),
+        ] {
+            let config: ClientConfig = serde_yaml::from_str(&format!(
+                "{{address: 'unresolvable.invalid:443', protocol: {protocol}}}"
+            ))
+            .unwrap();
+            let chain = ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(
+                    config.clone(),
+                ))),
+            };
+            assert_eq!(supports_udp_offline(&chain).unwrap(), expected);
+            let runtime =
+                try_build_client_proxy_chain(chain.hops.clone(), mock_resolver()).unwrap();
+            assert_eq!(runtime.supports_udp(), expected);
+            let pool = ClientChain {
+                hops: OneOrSome::One(ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::Config(socks_config(1080)),
+                    ConfigSelection::Config(config),
+                ]))),
+            };
+            assert_eq!(supports_udp_offline(&pool).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn quic_allowlists_fail_before_ignored_transport_construction() {
+        for groups in [None, Some("X25519MLKEM768"), Some("X25519")] {
+            let field = groups
+                .map(|g| format!("key_exchange_groups: [{g}]"))
+                .unwrap_or_default();
+            let direct: ClientConfig = serde_yaml::from_str(&format!(
+                "protocol: {{type: direct}}\ntransport: quic\nquic_settings: {{{field}}}\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                SocketConnectorImpl::from_config(&direct, None).is_err(),
+                groups.is_some()
+            );
+            let direct_chain =
+                OneOrSome::One(ClientChainHop::Single(ConfigSelection::Config(direct)));
+            assert_eq!(
+                try_build_client_proxy_chain(direct_chain, mock_resolver()).is_err(),
+                groups.is_some()
+            );
+
+            let proxy: ClientConfig = serde_yaml::from_str(&format!(
+                "address: '127.0.0.1:443'\nprotocol: {{type: socks}}\ntransport: quic\nquic_settings: {{{field}}}\n"
+            )).unwrap();
+            for hop in [
+                ClientChainHop::Single(ConfigSelection::Config(proxy.clone())),
+                ClientChainHop::Pool(OneOrSome::Some(vec![
+                    ConfigSelection::Config(socks_config(1080)),
+                    ConfigSelection::Config(proxy),
+                ])),
+            ] {
+                let chain = OneOrSome::Some(vec![
+                    ClientChainHop::Single(ConfigSelection::Config(direct_config())),
+                    hop,
+                ]);
+                let result = try_build_client_proxy_chain(chain, mock_resolver());
+                assert_eq!(result.is_err(), groups.is_some());
+                if let Err(error) = result {
+                    assert!(error.to_string().contains("QUIC key_exchange_groups"));
+                }
+            }
+        }
     }
 
     #[test]
@@ -284,21 +462,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "protocol: direct is only valid at hop 0")]
-    fn test_direct_at_hop1_panics() {
-        build_client_proxy_chain(
+    fn test_direct_at_hop1_returns_error() {
+        let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
                 ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
                 ClientChainHop::Single(ConfigSelection::Config(direct_config())),
             ]),
             mock_resolver(),
         );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
-    #[should_panic(expected = "protocol: direct is only valid at hop 0")]
-    fn test_direct_in_pool_at_hop1_panics() {
-        build_client_proxy_chain(
+    fn test_direct_in_pool_at_hop1_returns_error() {
+        let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![
                 ClientChainHop::Single(ConfigSelection::Config(socks_config(1080))),
                 ClientChainHop::Pool(OneOrSome::Some(vec![
@@ -308,17 +488,34 @@ mod tests {
             ]),
             mock_resolver(),
         );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
-    #[should_panic(expected = "was not resolved during config validation")]
-    fn test_unresolved_group_reference_panics() {
-        build_client_proxy_chain(
-            OneOrSome::One(ClientChainHop::Single(ConfigSelection::GroupName(
-                "unresolved_group".to_string(),
-            ))),
-            mock_resolver(),
+    fn test_empty_chain_returns_error() {
+        let result = try_build_client_proxy_chain(OneOrSome::Some(vec![]), mock_resolver());
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn test_unresolved_group_reference_returns_error() {
+        let selection = ConfigSelection::GroupName("unresolved_group".to_string());
+        for hop in [
+            ClientChainHop::Single(selection.clone()),
+            ClientChainHop::Pool(OneOrSome::One(selection)),
+        ] {
+            let result = try_build_client_proxy_chain(OneOrSome::One(hop), mock_resolver());
+            assert_eq!(
+                result.err().unwrap().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[test]

@@ -14,13 +14,14 @@ use crate::h2mux::H2MuxClientHandler;
 use crate::http_handler::HttpTcpClientHandler;
 use crate::naiveproxy::NaiveProxyTcpClientHandler;
 use crate::port_forward_handler::PortForwardClientHandler;
+use crate::reality::RealityClientHandler;
 use crate::resolver::Resolver;
-use crate::rustls_config_util::create_client_config;
+use crate::rustls_config_util::try_create_client_config;
 use crate::shadow_tls::ShadowTlsClientHandler;
 use crate::shadowsocks::ShadowsocksTcpHandler;
 use crate::snell::snell_handler::SnellClientHandler;
 use crate::socks_handler::SocksTcpClientHandler;
-use crate::tcp::chain_builder::build_client_chain_group;
+use crate::tcp::chain_builder::try_build_client_chain_group;
 use crate::tcp::tcp_handler::TcpClientHandler;
 use crate::tls_client_handler::TlsClientHandler;
 use crate::trojan_handler::TrojanTcpHandler;
@@ -43,15 +44,31 @@ pub fn create_tcp_client_handler(
     client_proxy_config: ClientProxyConfig,
     default_sni_hostname: Option<String>,
     resolver: Arc<dyn Resolver>,
-) -> Box<dyn TcpClientHandler> {
-    match client_proxy_config {
+) -> std::io::Result<Box<dyn TcpClientHandler>> {
+    Ok(match client_proxy_config {
+        ClientProxyConfig::Xhttp(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "XHTTP requires a connector-level carrier dialer",
+            ));
+        }
+        ClientProxyConfig::Wireguard(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WireGuard is a network connector and is only supported at hop 0",
+            ));
+        }
         ClientProxyConfig::Direct => {
-            panic!("Tried to create a direct tcp client handler");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "direct cannot be used as an inner proxy protocol",
+            ));
         }
         ClientProxyConfig::Http {
             username,
             password,
             resolve_hostname,
+            http_version,
         } => {
             let http_resolver = if resolve_hostname {
                 Some(resolver.clone())
@@ -61,6 +78,7 @@ pub fn create_tcp_client_handler(
             Box::new(HttpTcpClientHandler::new(
                 create_auth_credentials(username, password),
                 http_resolver,
+                http_version,
             ))
         }
         ClientProxyConfig::Socks { username, password } => Box::new(SocksTcpClientHandler::new(
@@ -93,9 +111,29 @@ pub fn create_tcp_client_handler(
             user_id,
             udp_enabled,
             h2mux,
+            encryption,
+            vision,
+            ..
         } => {
-            let handler: Box<dyn TcpClientHandler> =
-                Box::new(VlessTcpClientHandler::new(&user_id, udp_enabled));
+            if vision && h2mux.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Native VLESS Vision does not support H2MUX",
+                ));
+            }
+            let encryption = if encryption.is_disabled() {
+                None
+            } else {
+                Some(crate::vless::encryption::ClientEncryption::new(
+                    encryption.as_str(),
+                )?)
+            };
+            let handler: Box<dyn TcpClientHandler> = Box::new(VlessTcpClientHandler::new(
+                &user_id,
+                udp_enabled,
+                encryption,
+                vision,
+            )?);
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
@@ -123,6 +161,7 @@ pub fn create_tcp_client_handler(
         }
         ClientProxyConfig::Tls(tls_client_config) => {
             let TlsClientConfig {
+                key_exchange_groups,
                 verify,
                 server_fingerprints,
                 sni_hostname,
@@ -133,6 +172,8 @@ pub fn create_tcp_client_handler(
                 cert,
                 vision,
             } = tls_client_config;
+            key_exchange_groups.validate_vision(vision)?;
+            crate::config::validate_client_vision_protocol(vision, &protocol, "TLS")?;
 
             let sni_hostname = if sni_hostname.is_unspecified() {
                 if let Some(ref hostname) = default_sni_hostname {
@@ -154,17 +195,20 @@ pub fn create_tcp_client_handler(
                 (key_bytes, cert_bytes)
             });
 
-            let client_config = Arc::new(create_client_config(
+            let client_config = Arc::new(try_create_client_config(
                 verify,
                 server_fingerprints.into_vec(),
                 alpn_protocols.into_vec(),
                 sni_hostname.is_some(),
                 key_and_cert_bytes,
                 false, // tls13_only
-            ));
+                &key_exchange_groups,
+            )?);
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
+                Some(s) => {
+                    rustls::pki_types::ServerName::try_from(s).map_err(std::io::Error::other)?
+                }
                 // This is unused, since enable_sni is false, but connect_with still requires a
                 // parameter.
                 None => "example.com".try_into().unwrap(),
@@ -174,7 +218,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
-                    h2mux: _, // h2mux not supported with vision
+                    ..
                 } = protocol.as_ref()
                 else {
                     // Validated when loading config
@@ -191,7 +235,7 @@ pub fn create_tcp_client_handler(
                     *udp_enabled,
                 ))
             } else {
-                let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+                let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
 
                 Box::new(TlsClientHandler::new(
                     client_config,
@@ -203,30 +247,29 @@ pub fn create_tcp_client_handler(
         }
         ClientProxyConfig::Reality {
             public_key,
+            mldsa65_verify,
             short_id,
             sni_hostname,
             cipher_suites,
             vision,
             protocol,
         } => {
-            // Decode public key from base64url
+            crate::config::validate_client_vision_protocol(vision, &protocol, "REALITY")?;
             let public_key_bytes =
-                crate::reality::decode_public_key(&public_key).expect("Invalid REALITY public key");
-
-            // Decode short ID from hex string
+                crate::reality::decode_public_key(&public_key).map_err(std::io::Error::other)?;
+            let mldsa65_verify = mldsa65_verify
+                .as_deref()
+                .map(crate::reality::decode_mldsa65_verify)
+                .transpose()?;
             let short_id_bytes =
-                crate::reality::decode_short_id(&short_id).expect("Invalid REALITY short_id");
-
-            // Determine SNI hostname
-            let sni_hostname = sni_hostname.or(default_sni_hostname.clone());
-            let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s)
-                    .unwrap()
-                    .to_owned(),
-                None => {
-                    panic!("REALITY client requires sni_hostname to be specified");
-                }
+                crate::reality::decode_short_id(&short_id).map_err(std::io::Error::other)?;
+            let Some(sni_hostname) = sni_hostname.or(default_sni_hostname) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "REALITY client requires sni_hostname",
+                ));
             };
+            let server_name = crate::reality::parse_server_name(&sni_hostname)?;
 
             let cipher_suites = cipher_suites.into_vec();
 
@@ -234,7 +277,7 @@ pub fn create_tcp_client_handler(
                 let ClientProxyConfig::Vless {
                     user_id,
                     udp_enabled,
-                    h2mux: _, // h2mux not supported with vision
+                    ..
                 } = protocol.as_ref()
                 else {
                     unreachable!("Vision requires VLESS (should be validated during config load)")
@@ -243,24 +286,28 @@ pub fn create_tcp_client_handler(
                     .expect("Invalid user_id UUID")
                     .into_boxed_slice();
                 Box::new(
-                    crate::reality_client_handler::RealityClientHandler::new_vision_vless(
+                    RealityClientHandler::new_vision_vless(
                         public_key_bytes,
                         short_id_bytes,
                         server_name,
                         cipher_suites,
                         user_id_bytes,
                         *udp_enabled,
-                    ),
+                    )
+                    .with_mldsa65_verify(mldsa65_verify),
                 )
             } else {
-                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone());
-                Box::new(crate::reality_client_handler::RealityClientHandler::new(
-                    public_key_bytes,
-                    short_id_bytes,
-                    server_name,
-                    cipher_suites,
-                    inner_handler,
-                ))
+                let inner_handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
+                Box::new(
+                    RealityClientHandler::new(
+                        public_key_bytes,
+                        short_id_bytes,
+                        server_name,
+                        cipher_suites,
+                        inner_handler,
+                    )
+                    .with_mldsa65_verify(mldsa65_verify),
+                )
             }
         }
         ClientProxyConfig::ShadowTls {
@@ -272,7 +319,9 @@ pub fn create_tcp_client_handler(
             let enable_sni = sni_hostname.is_some();
 
             let server_name = match sni_hostname {
-                Some(s) => rustls::pki_types::ServerName::try_from(s).unwrap(),
+                Some(s) => {
+                    rustls::pki_types::ServerName::try_from(s).map_err(std::io::Error::other)?
+                }
                 None => "example.com".try_into().unwrap(), // Fallback
             };
 
@@ -281,16 +330,17 @@ pub fn create_tcp_client_handler(
             // an HMAC tag, and rustls doesn't validate session_id echo for TLS 1.3 ServerHello.
             // TLS 1.2 would fail anyway (no supported_versions extension), but restricting
             // here provides defense in depth and fails fast at the TLS level.
-            let client_config = Arc::new(create_client_config(
+            let client_config = Arc::new(try_create_client_config(
                 false,      // No WebPKI verification needed for ShadowTLS
                 Vec::new(), // No fingerprints
                 Vec::new(), // No ALPN
                 enable_sni, // Enable SNI if hostname provided
                 None,       // No client cert
                 true,       // tls13_only - required for ShadowTLS v3
-            ));
+                &Default::default(),
+            )?);
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+            let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
 
             Box::new(ShadowTlsClientHandler::new(
                 password,
@@ -306,7 +356,7 @@ pub fn create_tcp_client_handler(
             h2mux,
         } => {
             let handler: Box<dyn TcpClientHandler> =
-                Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled));
+                Box::new(VmessTcpClientHandler::new(&cipher, &user_id, udp_enabled)?);
             if let Some(h2mux_config) = h2mux {
                 Box::new(H2MuxClientHandler::new(
                     Arc::from(handler),
@@ -324,7 +374,7 @@ pub fn create_tcp_client_handler(
                 protocol,
             } = websocket_client_config;
 
-            let handler = create_tcp_client_handler(*protocol, None, resolver.clone());
+            let handler = create_tcp_client_handler(*protocol, None, resolver.clone())?;
 
             Box::new(WebsocketTcpClientHandler::new(
                 matching_path,
@@ -342,10 +392,7 @@ pub fn create_tcp_client_handler(
             let padding = match padding_scheme {
                 Some(lines) => {
                     let scheme = lines.join("\n");
-                    Arc::new(
-                        PaddingFactory::new(scheme.as_bytes())
-                            .expect("Invalid padding scheme in AnyTLS config"),
-                    )
+                    Arc::new(PaddingFactory::new(scheme.as_bytes()).map_err(std::io::Error::other)?)
                 }
                 None => PaddingFactory::default_factory(),
             };
@@ -358,29 +405,74 @@ pub fn create_tcp_client_handler(
         } => Box::new(NaiveProxyTcpClientHandler::new(
             &username, &password, padding,
         )),
-    }
+    })
 }
 
 pub fn create_tcp_client_proxy_selector(
     rules: Vec<RuleConfig>,
     resolver: Arc<dyn Resolver>,
-) -> ClientProxySelector {
+) -> std::io::Result<ClientProxySelector> {
     let rules = rules
         .into_iter()
         .map(|rule_config| {
-            let RuleConfig { masks, action } = rule_config;
+            let RuleConfig {
+                criteria, action, ..
+            } = rule_config;
             let connect_action = match action {
                 RuleActionConfig::Allow {
                     override_address,
                     client_chains,
                 } => {
-                    let chain_group = build_client_chain_group(client_chains, resolver.clone());
+                    let chain_group =
+                        try_build_client_chain_group(client_chains, resolver.clone())?
+                            .with_description(criteria.description.clone());
                     ConnectAction::new_allow(override_address, chain_group)
                 }
                 RuleActionConfig::Block => ConnectAction::new_block(),
             };
-            ConnectRule::new(masks.into_vec(), connect_action)
+            Ok(ConnectRule::compiled(
+                criteria.compiled.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "routing predicates must be compiled during config preparation",
+                    )
+                })?,
+                criteria.no_resolve,
+                connect_action,
+            ))
         })
-        .collect::<Vec<_>>();
-    ClientProxySelector::new(rules)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    ClientProxySelector::new(rules).with_fake_dns_context(resolver.fake_dns_context())
+}
+
+#[cfg(test)]
+pub(crate) fn create_test_selector(
+    mut rules: Vec<RuleConfig>,
+    resolver: Arc<dyn Resolver>,
+) -> std::io::Result<ClientProxySelector> {
+    for rule in &mut rules {
+        rule.compile(&mut crate::rules::Compiler::default())?;
+    }
+    create_tcp_client_proxy_selector(rules, resolver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_requires_precompiled_rules() {
+        let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
+        let mut rule = RuleConfig::default();
+        let error =
+            create_tcp_client_proxy_selector(vec![rule.clone()], resolver.clone()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "routing predicates must be compiled during config preparation"
+        );
+        rule.compile(&mut crate::rules::Compiler::default())
+            .unwrap();
+        create_tcp_client_proxy_selector(vec![rule], resolver).unwrap();
+    }
 }

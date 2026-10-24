@@ -12,10 +12,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::ServerConfig;
-use rustls_pemfile::{certs, pkcs8_private_keys};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use std::convert::Infallible;
 use std::fs::File;
-use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -501,6 +500,7 @@ pub async fn start_local_http_server(ip: &str, port: u16) -> std::io::Result<Tes
                     let io = TokioIo::new(tcp);
                     connections.spawn(async move {
                         if let Err(error) = http1::Builder::new()
+                            .half_close(true)
                             .timer(TokioTimer::new())
                             .serve_connection(io, service_fn(handle_request))
                             .await
@@ -529,15 +529,13 @@ fn create_tls_config(
 ) -> std::io::Result<Arc<ServerConfig>> {
     // Load certificate
     let cert_file = File::open(cert_path)?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<_> = certs(&mut cert_reader)
+    let certs: Vec<_> = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<_, _>>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     // Load private key
     let key_file = File::open(key_path)?;
-    let mut key_reader = BufReader::new(key_file);
-    let keys = pkcs8_private_keys(&mut key_reader)
+    let keys = PrivatePkcs8KeyDer::pem_reader_iter(key_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
@@ -686,6 +684,110 @@ pub async fn start_tls_stream_echo_server(
     Ok(TestServer::new(task, address))
 }
 
+pub fn reality_tls_template_config() -> std::io::Result<Arc<ServerConfig>> {
+    use rustls::crypto::aws_lc_rs::{cipher_suite, kx_group};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+        .map_err(std::io::Error::other)?;
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites = vec![cipher_suite::TLS13_AES_128_GCM_SHA256];
+    provider.kx_groups = vec![kx_group::X25519];
+    let config = ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(std::io::Error::other)?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()).into(),
+        )
+        .map_err(std::io::Error::other)?;
+    Ok(Arc::new(config))
+}
+
+fn template_server_flight(
+    connection: &mut rustls::ServerConnection,
+    mut client_hello: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    while !client_hello.is_empty() {
+        connection.read_tls(&mut client_hello)?;
+        connection
+            .process_new_packets()
+            .map_err(std::io::Error::other)?;
+    }
+    let mut wire = Vec::new();
+    connection.write_tls(&mut wire)?;
+    Ok(wire)
+}
+
+async fn serve_reality_tls_template(
+    stream: &mut tokio::net::TcpStream,
+    config: Arc<ServerConfig>,
+) -> std::io::Result<()> {
+    let mut header = [0; 5];
+    stream.read_exact(&mut header).await?;
+    let payload_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+    let mut client_hello = header.to_vec();
+    client_hello.resize(5 + payload_len, 0);
+    stream.read_exact(&mut client_hello[5..]).await?;
+
+    let mut target =
+        rustls::ServerConnection::new(config.clone()).map_err(std::io::Error::other)?;
+    let wire = template_server_flight(&mut target, &client_hello)?;
+    let server_hello_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+    let prepared = rustls::reality::PreparedServerHello::new(
+        &client_hello[5..],
+        &wire[5..5 + server_hello_len],
+        config.crypto_provider(),
+    )
+    .map_err(std::io::Error::other)?;
+    // Each record must hold its complete replacement message, including the REALITY certificate.
+    let plan = rustls::reality::FlightPlan::new(&[64, 4096, 128, 96], Some(64))
+        .map_err(std::io::Error::other)?;
+    let mut target = rustls::ServerConnection::new_reality(config, prepared.with_flight_plan(plan))
+        .map_err(std::io::Error::other)?;
+    let wire = template_server_flight(&mut target, &client_hello)?;
+    // Split the optional seventh record after three header bytes.
+    let split = wire.len() - 61;
+    stream.write_all(&wire[..split]).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    stream.write_all(&wire[split..]).await?;
+    tokio::io::copy(stream, &mut tokio::io::sink()).await?;
+    Ok(())
+}
+
+pub async fn start_reality_tls_template() -> std::io::Result<TestServer> {
+    let config = reality_tls_template_config()?;
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let address = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((mut stream, _)) => {
+                        let config = config.clone();
+                        connections.spawn(async move {
+                            if let Err(error) = serve_reality_tls_template(&mut stream, config).await {
+                                eprintln!("[TEST_SERVER] TLS template: {error}");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        eprintln!("[TEST_SERVER] TLS template accept failed: {error}");
+                        break;
+                    }
+                },
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        eprintln!("[TEST_SERVER] TLS template task failed: {error}");
+                    }
+                }
+            }
+        }
+    });
+    Ok(TestServer::new(task, address))
+}
+
 // Re-export certificate generation from certs module
 pub use super::certs::generate_test_cert_files as generate_test_cert;
 
@@ -785,6 +887,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_server_accepts_request_followed_by_fin() -> std::io::Result<()> {
+        let server = start_local_http_server("0.0.0.0", 0).await?;
+        // Queues the request and FIN before the current-thread runtime can accept it.
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", server.local_addr().port()))?;
+        std::io::Write::write_all(
+            &mut client,
+            b"GET /bytes/1024 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n",
+        )?;
+        client.shutdown(std::net::Shutdown::Write)?;
+        client.set_nonblocking(true)?;
+        let mut client = tokio::net::TcpStream::from_std(client)?;
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut response),
+        )
+        .await??;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(response.len() >= 1024);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dropping_server_guard_stops_listener() -> Result<(), Box<dyn std::error::Error>> {
         let mut port_helper = super::super::port_helper::PortHelper::new();
         let (ip, port) = port_helper.get_listener_port();
@@ -802,6 +927,45 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_tls_template_closes_pending_handshake()
+    -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let server = start_reality_tls_template().await?;
+            let address = ("127.0.0.1", server.local_addr().port());
+            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            let config = rustls::ClientConfig::builder_with_provider(
+                reality_tls_template_config()?.crypto_provider().clone(),
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+            let mut client =
+                rustls::ClientConnection::new(Arc::new(config), "localhost".try_into()?)?;
+            let mut hello = Vec::new();
+            client.write_tls(&mut hello)?;
+            stream.write_all(&hello).await?;
+
+            // Receiving ServerHello proves the connection is owned by a handshake task,
+            // not merely queued on the listener. No client Finished is sent.
+            let mut header = [0; 5];
+            stream.read_exact(&mut header).await?;
+            assert_eq!(header[0], 22);
+            let mut body = vec![0; u16::from_be_bytes([header[3], header[4]]) as usize];
+            stream.read_exact(&mut body).await?;
+            assert_eq!(body[0], 2);
+            assert!(client.is_handshaking());
+
+            drop(server);
+            stream.read_to_end(&mut Vec::new()).await?;
+            while tokio::net::TcpStream::connect(address).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+        .await?
     }
 
     #[tokio::test]

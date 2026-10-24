@@ -10,6 +10,21 @@ use std::io::Write;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+static DEFAULT_LEVEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn default_level() -> LevelFilter {
+    let value = DEFAULT_LEVEL.load(std::sync::atomic::Ordering::Relaxed);
+    [
+        LevelFilter::Off,
+        LevelFilter::Error,
+        LevelFilter::Warn,
+        LevelFilter::Info,
+        LevelFilter::Debug,
+        LevelFilter::Trace,
+    ][value]
+        .min(log::STATIC_MAX_LEVEL)
+}
+
 /// Receives pre-formatted log lines. Implementations handle one output destination.
 pub trait LogWriter: Send + Sync {
     /// Writes a pre-formatted log line. `formatted` does NOT include a trailing newline.
@@ -46,6 +61,21 @@ pub struct FileLogWriter {
     file: parking_lot::Mutex<File>,
 }
 
+fn escaped_file_record(formatted: &str) -> String {
+    let mut line = String::with_capacity(formatted.len() + 1);
+    for c in formatted.chars() {
+        if c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            line.extend(c.escape_default());
+        } else {
+            line.push(c);
+        }
+    }
+    line.push('\n');
+    line
+}
+
 impl FileLogWriter {
     pub fn new(path: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -57,9 +87,8 @@ impl FileLogWriter {
 
 impl LogWriter for FileLogWriter {
     fn write_log(&self, _record: &Record, formatted: &str) {
+        let line = escaped_file_record(formatted);
         let mut guard = self.file.lock();
-        let mut line = formatted.to_string();
-        line.push('\n');
         let _ = guard.write_all(line.as_bytes());
     }
 
@@ -89,8 +118,7 @@ impl LogWriter for DynamicFileLogWriter {
         if let Some(mutex) = self.file.get() {
             let mut guard = mutex.lock();
             if let Some(ref mut file) = *guard {
-                let mut line = formatted.to_string();
-                line.push('\n');
+                let line = escaped_file_record(formatted);
                 let _ = file.write_all(line.as_bytes());
             }
         }
@@ -181,6 +209,14 @@ impl Log for MultiLogger {
 /// Directives are sorted by name length; `log::set_max_level` is set to the
 /// maximum level across all directives so records reach our `log()` method.
 pub fn init_multi_logger(writers: Vec<Box<dyn LogWriter>>, mut directives: Vec<Directive>) {
+    DEFAULT_LEVEL.store(
+        directives
+            .iter()
+            .rev()
+            .find(|directive| directive.name.is_none())
+            .map_or(LevelFilter::Off, |directive| directive.level) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     directives.sort_by_key(|d| d.name.as_ref().map_or(0, |n| n.len()));
     let max_level = directives
         .iter()
@@ -276,6 +312,52 @@ pub fn resolve_directives() -> Vec<Directive> {
 mod tests {
     use super::*;
     use log::Level;
+
+    fn check_file_records(writer: &dyn LogWriter, path: &std::path::Path) {
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(
+            &record,
+            "peer\r\nforged\t\u{1b}[31m\u{0}\u{7}\u{7f}\u{85}\u{2028}\u{2029}\u{202e}\u{2066} caf\u{e9} \u{65e5}\u{672c}",
+        );
+        writer.write_log(&record, "next record");
+        writer.flush();
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert_eq!(
+            contents,
+            "peer\\r\\nforged\\t\\u{1b}[31m\\u{0}\\u{7}\\u{7f}\\u{85}\\u{2028}\\u{2029}\\u{202e}\\u{2066} caf\u{e9} \u{65e5}\u{672c}\nnext record\n"
+        );
+        assert_eq!(contents.lines().count(), 2);
+        assert!(contents.chars().all(|c| !c.is_control() || c == '\n'));
+    }
+
+    #[test]
+    fn file_writer_escapes_controls_and_preserves_unicode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let writer = FileLogWriter::new(path.to_str().unwrap()).unwrap();
+        check_file_records(&writer, &path);
+    }
+
+    #[test]
+    fn dynamic_file_writer_escapes_records_after_installation() {
+        static FILE: std::sync::OnceLock<parking_lot::Mutex<Option<File>>> =
+            std::sync::OnceLock::new();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("log");
+        let writer = DynamicFileLogWriter::new(&FILE);
+        let record = Record::builder().args(format_args!("unused")).build();
+        writer.write_log(&record, "before initialization");
+        writer.flush();
+        let file = FILE.get_or_init(|| parking_lot::Mutex::new(None));
+        writer.write_log(&record, "before installation");
+        writer.flush();
+        *file.lock() = Some(File::create(&path).unwrap());
+        check_file_records(&writer, &path);
+        *file.lock() = None;
+        writer.write_log(&record, "after removal");
+        writer.flush();
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
 
     /// Builds a MultiLogger (no writers) from directives for testing matches().
     fn logger_from(mut directives: Vec<Directive>) -> MultiLogger {
@@ -427,5 +509,55 @@ mod tests {
     fn matches_no_directives() {
         let logger = logger_from(vec![]);
         assert!(!logger.matches(Level::Error, "shoes"));
+    }
+}
+#[cfg(test)]
+pub(crate) mod test_capture {
+    use std::cell::RefCell;
+    use std::sync::Once;
+
+    thread_local! {
+        static RECORDS: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    struct Logger;
+
+    impl log::Log for Logger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            use std::fmt::Write;
+            RECORDS.with(|records| {
+                if let Some(output) = records.borrow_mut().as_mut() {
+                    let _ = writeln!(output, "{}", record.args());
+                }
+            });
+        }
+        fn flush(&self) {}
+    }
+
+    pub struct Capture;
+
+    impl Capture {
+        pub fn new() -> Self {
+            static INIT: Once = Once::new();
+            INIT.call_once(|| {
+                log::set_logger(&Logger).unwrap();
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            RECORDS.with(|records| assert!(records.replace(Some(String::new())).is_none()));
+            Self
+        }
+
+        pub fn finish(self) -> String {
+            RECORDS.with(|records| records.take().unwrap())
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            RECORDS.with(|records| records.take());
+        }
     }
 }

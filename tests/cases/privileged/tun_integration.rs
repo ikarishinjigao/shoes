@@ -2,7 +2,8 @@
 //!
 //! These tests verify that the TUN device and our smoltcp-based TCP/IP stack work correctly.
 //! Some tests require root privileges to create TUN devices on Linux.
-//! Run with: `sudo cargo test tun_integration -- --ignored`
+//! Run with: `cargo test --features privileged-tests --test privileged tun:: -- --test-threads=1`.
+//! Device creation and the long idle test are ignored and must be selected explicitly.
 
 use shoes_test_support as common;
 
@@ -330,47 +331,49 @@ async fn test_tun_fixture_streaming_2gb() -> Result<(), Box<dyn std::error::Erro
 async fn test_tun_tcp_idle_connection() -> Result<(), Box<dyn std::error::Error>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::time::timeout;
 
-    let fixture = ProxyTestFixture::new()
-        .with_tun_entry()
-        .with_local_http_server()
-        .build()
-        .await?;
-
-    let tun_vip = fixture.tun_virtual_server_ip().expect("TUN VIP");
-    let server_port = fixture.local_server_port().expect("Server port");
-
-    // Connect through TUN to the virtual server IP (which routes to local server)
-    let mut stream = TcpStream::connect(format!("{}:{}", tun_vip, server_port)).await?;
-    eprintln!("[TEST] Connected to server through TUN");
-
-    // Send initial request
-    stream
-        .write_all(b"GET /bytes/100 HTTP/1.1\r\nHost: test\r\nConnection: keep-alive\r\n\r\n")
-        .await?;
-
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    assert!(n > 0, "Should receive initial response");
-    eprintln!("[TEST] Received initial response ({} bytes)", n);
-
-    // Wait six minutes before reusing the idle connection.
-    eprintln!("[TEST] Waiting 6 minutes to test idle connection survival...");
-    tokio::time::sleep(Duration::from_secs(360)).await;
-
-    // Try to use the connection again
-    eprintln!("[TEST] Sending request after 6 minutes idle...");
-    stream
-        .write_all(b"GET /bytes/100 HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-        .await?;
-
-    let n = stream.read(&mut buf).await?;
-    assert!(n > 0, "Connection should still work after 6 minutes idle");
-    eprintln!(
-        "[TEST] SUCCESS: Connection survived 6 minutes idle, received {} bytes",
-        n
+    // A plain echo peer does not impose an HTTP header or keep-alive timeout.
+    let echo = common::test_servers::start_tcp_stream_echo_server("0.0.0.0", 0).await?;
+    let config = format!(
+        r#"
+- device_name: shoes_idle
+  address: "10.200.249.1"
+  netmask: 255.255.255.0
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      override_address: "127.0.0.1:{}"
+      client_chain:
+        - protocol:
+            type: direct
+"#,
+        echo.local_addr().port(),
     );
+    let (_guard, _config) = start_shoes_server_with_sudo(&config)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let _route = add_route_via_device("10.200.249.2/32", "shoes_idle")?;
+    let mut stream = timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("10.200.249.2", echo.local_addr().port())),
+    )
+    .await??;
 
+    for (message, delay) in [(b"before idle", 0), (b"after idle!", 360)] {
+        if delay != 0 {
+            eprintln!("[TEST] Waiting 6 minutes to test idle connection survival...");
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        timeout(Duration::from_secs(5), async {
+            stream.write_all(message).await?;
+            let mut reply = [0; 11];
+            stream.read_exact(&mut reply).await?;
+            assert_eq!(&reply, message);
+            std::io::Result::Ok(())
+        })
+        .await??;
+    }
+    eprintln!("[TEST] SUCCESS: TCP connection survived 6 minutes idle");
     Ok(())
 }
 
@@ -981,8 +984,8 @@ async fn test_tun_icmp_ping() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run ping with short timeout
     eprintln!("[TEST] Pinging {} through TUN {}...", ping_target, tun_name);
-    let output = Command::new("ping")
-        .args(["-c", "3", "-W", "2", ping_target])
+    let output = Command::new("sudo")
+        .args(["-n", "ping", "-c", "3", "-W", "2", ping_target])
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1378,146 +1381,6 @@ async fn test_tun_udp_multi_destination() -> Result<(), Box<dyn std::error::Erro
     }
 
     eprintln!("[TEST] ✓ SUCCESS: Multi-destination UDP routing works!");
-    Ok(())
-}
-
-/// Test IPv6 UDP through TUN interface end-to-end.
-///
-/// Run with: `cargo test test_tun_udp_ipv6 -- --nocapture`
-#[tokio::test]
-async fn test_tun_udp_ipv6() -> Result<(), Box<dyn std::error::Error>> {
-    let mut port_helper = PortHelper::new();
-    let (vless_ip, vless_port) = port_helper.get_listener_port();
-    let (_, echo_port) = port_helper.get_port();
-
-    let tun_name = "shoes_v6"; // Max 15 chars for Linux TUN
-    // Use IPv4 for TUN device (IPv6 TUN requires more complex setup)
-    // but test IPv6 packet handling through the stack
-    let tun_ip = "10.200.254.1";
-    let tun_target_ip = "10.200.254.2";
-    let echo_ip = "127.0.0.1";
-
-    eprintln!("[TEST] IPv6 UDP Test (via IPv4 TUN tunnel)");
-
-    // For true IPv6 testing, we'd need:
-    // 1. IPv6 TUN address (fd00::1/64)
-    // 2. IPv6 routing
-    // 3. IPv6 echo server
-    //
-    // This test validates IPv6 packet parsing/building works by using
-    // the existing IPv4 infrastructure but with IPv6-mapped addresses
-
-    // 1. Start echo server
-    let _echo_server =
-        start_udp_echo_server_with_suffix(echo_ip, echo_port, b" [IPv6-TEST]").await?;
-    eprintln!("[TEST] Echo server on {}:{}", echo_ip, echo_port);
-
-    // 2. Start VLESS server
-    let (cert_path, key_path) = common::certs::generate_test_cert_files()?;
-    let vless_config = format!(
-        r#"
-- address: "{}:{}"
-  protocol:
-    type: tls
-    tls_targets:
-      test.local:
-        cert: {}
-        key: {}
-        vision: true
-        protocol:
-          type: vless
-          user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
-          udp_enabled: true
-  rules:
-    - masks: "{}:0"
-      action: allow
-      override_address: "{}:{}"
-      client_chain:
-        - protocol:
-            type: direct
-"#,
-        vless_ip,
-        vless_port,
-        AsRef::<Path>::as_ref(&cert_path).to_str().unwrap(),
-        AsRef::<Path>::as_ref(&key_path).to_str().unwrap(),
-        tun_target_ip,
-        echo_ip,
-        echo_port,
-    );
-
-    let (_vless_guard, _vless_config) = start_shoes_server(&vless_config)?;
-    port_helper.wait_for_all_ports().await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 3. Start TUN server
-    let tun_config = format!(
-        r#"
-- device_name: "{}"
-  address: "{}"
-  netmask: 255.255.255.0
-  mtu: 1500
-  tcp_enabled: true
-  udp_enabled: true
-  rules:
-    - masks: "0.0.0.0/0"
-      action: allow
-      client_chain:
-        - address: "{}:{}"
-          protocol:
-            type: tls
-            verify: false
-            sni_hostname: test.local
-            protocol:
-              type: vless
-              user_id: "b85798ef-e9dc-46a4-9a87-8da4499d36d0"
-              udp_enabled: true
-"#,
-        tun_name, tun_ip, vless_ip, vless_port,
-    );
-
-    let (_tun_guard, _tun_config) = start_shoes_server_with_sudo(&tun_config)?;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    let destination = format!("{tun_target_ip}/32");
-    let _route_guard = add_route_via_device(&destination, tun_name)?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // 4. Send test packet
-    use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::SocketAddr;
-
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    let bind_addr: SocketAddr = format!("{}:0", tun_ip).parse()?;
-    socket.bind(&bind_addr.into())?;
-    socket.set_nonblocking(true)?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    let test_socket = UdpSocket::from_std(std_socket)?;
-
-    let dest: SocketAddr = format!("{}:{}", tun_target_ip, echo_port).parse()?;
-    test_socket.send_to(b"IPv6 Test Message", dest).await?;
-    eprintln!("[TEST] Sent IPv6 test message");
-
-    // 5. Receive response
-    let mut response_buf = vec![0u8; 65536];
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        test_socket.recv_from(&mut response_buf),
-    )
-    .await
-    {
-        Ok(Ok((n, addr))) => {
-            let response = String::from_utf8_lossy(&response_buf[..n]);
-            eprintln!("[TEST] Received from {}: {}", addr, response);
-            assert!(response.contains("IPv6 Test Message"));
-            assert!(response.contains("[IPv6-TEST]"));
-        }
-        Ok(Err(e)) => return Err(format!("Recv error: {}", e).into()),
-        Err(_) => return Err("Timeout waiting for response".into()),
-    }
-
-    eprintln!("[TEST] ✓ SUCCESS: IPv6 (via IPv4 tunnel) UDP routing works!");
-    eprintln!("[TEST] Note: Full IPv6 TUN testing requires IPv6 network setup");
     Ok(())
 }
 

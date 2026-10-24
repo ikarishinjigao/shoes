@@ -15,8 +15,10 @@
 //!
 //! `protocol: direct` does NOT create a ProxyConnector - it only creates a SocketConnector.
 
+use super::carrier_dialer::CarrierDialer;
 use async_trait::async_trait;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::{AsyncMessageStream, AsyncStream};
@@ -32,7 +34,41 @@ use crate::tcp::tcp_handler::TcpClientSetupResult;
 ///
 /// - `TcpClientConnector`: For all proxy protocols (SOCKS5, HTTP, VMess, VLESS, etc.)
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait ProxyConnector: Send + Sync + Debug {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        _resolver: &Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        Ok(target)
+    }
+
+    fn needs_carrier_dialer(&self) -> bool {
+        false
+    }
+
+    async fn connect_tcp_with_dialer(
+        &self,
+        dialer: Arc<dyn CarrierDialer>,
+        target: &ResolvedLocation,
+    ) -> std::io::Result<TcpClientSetupResult> {
+        self.setup_tcp_stream(dialer.open_stream().await?, target)
+            .await
+    }
+
+    async fn connect_udp_with_dialer(
+        &self,
+        dialer: Arc<dyn CarrierDialer>,
+        target: ResolvedLocation,
+    ) -> std::io::Result<Box<dyn AsyncMessageStream>> {
+        self.setup_udp_bidirectional(dialer.open_stream().await?, target)
+            .await
+    }
+
     /// Returns the proxy server address.
     ///
     /// This is used to determine where the SocketConnector should connect to
@@ -41,6 +77,13 @@ pub trait ProxyConnector: Send + Sync + Debug {
 
     /// Check if this connector supports UDP-over-TCP tunneling.
     fn supports_udp_over_tcp(&self) -> bool;
+
+    async fn try_reuse_tcp_stream(
+        &self,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        Ok(None)
+    }
 
     /// Setup protocol on existing stream.
     ///

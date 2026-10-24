@@ -1,4 +1,6 @@
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -38,9 +40,8 @@ pub enum TcpServerSetupResult {
         /// The proxy selector to use for routing this connection
         proxy_selector: Arc<ClientProxySelector>,
     },
-    /// Connection has been fully handled (e.g., spawned as a background task).
-    /// No further processing needed by the caller.
-    AlreadyHandled,
+    /// Long-lived work, polled outside the setup deadline and cancelled with its owner.
+    Session(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 
 impl TcpServerSetupResult {
@@ -64,12 +65,16 @@ impl TcpServerSetupResult {
             } => {
                 *flush = need_initial_flush;
             }
-            TcpServerSetupResult::AlreadyHandled => {}
+            TcpServerSetupResult::Session(_) => {}
         }
     }
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpServerHandler: Send + Sync + Debug {
     async fn setup_server_stream(
         &self,
@@ -86,7 +91,34 @@ pub struct TcpClientSetupResult {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async-trait adds must_use to boxed futures"
+)]
 pub trait TcpClientHandler: Send + Sync + Debug {
+    /// Resolve protocol-local targets with the current dial's resolver, including on reuse.
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        _resolver: &Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        Ok(target)
+    }
+
+    /// Validates the immediately enclosing TLS layer before any protocol bytes are sent.
+    fn validate_alpn(&self, _alpn: Option<&[u8]>) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Opens a logical stream on an existing session without acquiring a new transport.
+    /// Only a miss permits cold setup; an open error must not retry the request.
+    async fn try_reuse_tcp_stream(
+        &self,
+        _target: &ResolvedLocation,
+    ) -> std::io::Result<Option<TcpClientSetupResult>> {
+        Ok(None)
+    }
+
     /// Setup a client connection through this proxy.
     ///
     /// # Arguments

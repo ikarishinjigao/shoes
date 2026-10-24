@@ -9,13 +9,11 @@ use std::time::Duration;
 
 use hickory_resolver::net::runtime::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::net::runtime::{QuicSocketBinder, RuntimeProvider, Spawn, TokioTime};
-use quinn::Runtime as QuinnRuntime;
 
 use crate::address::{Address, NetLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_chain::ClientChainGroup;
 use crate::resolver::Resolver;
-use crate::socket_util::new_udp_socket;
 
 #[cfg(test)]
 const TEST_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -28,9 +26,7 @@ pub struct ProxyRuntimeProvider {
     /// Resolver for proxy server hostnames (not the DNS queries themselves).
     /// Uses NativeResolver since we can't use the DNS server we're trying to reach.
     bootstrap_resolver: Arc<dyn Resolver>,
-    /// Bind interface for UDP/QUIC (from direct-only chain).
-    bind_interface: Option<String>,
-    /// QUIC socket binder that uses the bind_interface.
+    /// QUIC socket binder that selects from the same direct-only chain.
     quic_binder: ProxyQuicBinder,
     /// Timeout for establishing connections to DNS upstreams.
     connect_timeout: Duration,
@@ -43,17 +39,21 @@ impl ProxyRuntimeProvider {
         bootstrap_resolver: Arc<dyn Resolver>,
         connect_timeout: Duration,
     ) -> Self {
-        let bind_interface = chain_group.get_bind_interface().map(ToString::to_string);
         let quic_binder = ProxyQuicBinder {
-            bind_interface: bind_interface.clone(),
+            chain_group: chain_group.clone(),
+            memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
         };
         Self {
             chain_group,
             bootstrap_resolver,
-            bind_interface,
             quic_binder,
             connect_timeout,
         }
+    }
+
+    pub fn with_quic_memory(mut self, bytes: usize) -> Self {
+        self.quic_binder.memory_bytes = bytes;
+        self
     }
 }
 
@@ -108,7 +108,12 @@ impl RuntimeProvider for ProxyRuntimeProvider {
                         server_addr,
                         started.elapsed()
                     );
-                    Ok(AsyncIoTokioAsStd(result.client_stream))
+                    let stream: Box<dyn AsyncStream> =
+                        Box::new(crate::prepend_stream::PrependStream::new(
+                            result.client_stream,
+                            result.early_data.map(Vec::into_boxed_slice),
+                        ));
+                    Ok(AsyncIoTokioAsStd(stream))
                 }
                 Ok(Err(e)) => {
                     log::warn!(
@@ -141,28 +146,31 @@ impl RuntimeProvider for ProxyRuntimeProvider {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Pin<Box<dyn Send + Future<Output = Result<Self::Udp, io::Error>>>> {
-        let bind_interface = self.bind_interface.clone();
+        let chain_group = self.chain_group.clone();
 
         Box::pin(async move {
-            if bind_interface.is_some() {
-                // Use our socket_util which supports bind_interface.
-                new_udp_socket(local_addr.is_ipv6(), bind_interface)
-            } else {
-                // Default: bind directly.
-                tokio::net::UdpSocket::bind(local_addr).await
-            }
+            let bind_interface = chain_group.select_bind_interface()?.map(str::to_owned);
+            let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+                local_addr.is_ipv6(),
+                bind_interface,
+                Some(local_addr),
+            )?;
+            tokio::net::UdpSocket::from_std(socket.into())
         })
     }
 
     fn quic_binder(&self) -> Option<&dyn QuicSocketBinder> {
-        Some(&self.quic_binder)
+        self.chain_group
+            .is_direct_only()
+            .then_some(&self.quic_binder as &dyn QuicSocketBinder)
     }
 }
 
 /// QUIC socket binder that supports bind_interface.
 #[derive(Clone)]
 struct ProxyQuicBinder {
-    bind_interface: Option<String>,
+    chain_group: Arc<ClientChainGroup>,
+    memory_bytes: usize,
 }
 
 impl QuicSocketBinder for ProxyQuicBinder {
@@ -171,35 +179,14 @@ impl QuicSocketBinder for ProxyQuicBinder {
         local_addr: SocketAddr,
         _server_addr: SocketAddr,
     ) -> Result<Arc<dyn quinn::AsyncUdpSocket>, io::Error> {
-        let socket = if self.bind_interface.is_some() {
-            // Use socket2 for bind_interface support.
-            let socket2_socket = crate::socket_util::new_socket2_udp_socket(
-                local_addr.is_ipv6(),
-                self.bind_interface.clone(),
-                Some(local_addr),
-                false,
-            )?;
-            // Convert socket2 -> std::net::UdpSocket.
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::FromRawFd;
-                use std::os::unix::io::IntoRawFd;
-                let raw_fd = socket2_socket.into_raw_fd();
-                unsafe { std::net::UdpSocket::from_raw_fd(raw_fd) }
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::FromRawSocket;
-                use std::os::windows::io::IntoRawSocket;
-                let raw_socket = socket2_socket.into_raw_socket();
-                unsafe { std::net::UdpSocket::from_raw_socket(raw_socket) }
-            }
-        } else {
-            // Default: bind directly.
-            std::net::UdpSocket::bind(local_addr)?
-        };
-
-        quinn::TokioRuntime.wrap_udp_socket(socket)
+        let memory = crate::resources::try_quic_memory(self.memory_bytes)
+            .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
+        let socket = crate::socket_util::new_outbound_socket2_udp_socket(
+            local_addr.is_ipv6(),
+            self.chain_group.select_bind_interface()?.map(str::to_owned),
+            Some(local_addr),
+        )?;
+        crate::quic_endpoint::socket_with_memory(socket.into(), memory)
     }
 }
 
@@ -241,7 +228,7 @@ mod tests {
 
     fn build_pending_chain_group() -> ClientChainGroup {
         ClientChainGroup::new(vec![ClientProxyChain::new(
-            vec![InitialHopEntry::Direct(Box::new(PendingSocketConnector))],
+            vec![InitialHopEntry::Direct(Arc::new(PendingSocketConnector))],
             vec![],
         )])
     }
@@ -281,6 +268,70 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn new_dns_sockets_follow_direct_selector_changes() {
+        let config = r#"
+- client_group: dns-route
+  strategy: selector
+  default: usable
+  client_proxies:
+    - name: unavailable
+      bind_interface: shoes-missing
+      protocol: {type: direct}
+    - name: usable
+      protocol: {type: direct}
+- dns_group: upstream
+  dns_servers:
+    - url: udp://192.0.2.1
+      client_chain: dns-route
+"#;
+        let mut validated =
+            crate::config::create_server_configs(serde_yaml::from_str(config).unwrap()).unwrap();
+        let mut owner = crate::control::selection::SelectionOwner::new(None).unwrap();
+        owner
+            .activate(validated.catalog.take().unwrap().selection)
+            .unwrap();
+        let resolver: Arc<dyn Resolver> = Arc::new(NativeResolver::new());
+        let chains = validated.dns_groups.remove(0).specs.remove(0).client_chains;
+        let group = crate::tcp::chain_builder::try_build_client_chain_group(
+            crate::option_util::NoneOrSome::Some(chains),
+            resolver.clone(),
+        )
+        .unwrap();
+        let provider =
+            ProxyRuntimeProvider::with_bootstrap(Arc::new(group), resolver, TEST_CONNECT_TIMEOUT)
+                .with_quic_memory(0);
+        let local = "0.0.0.0:0".parse().unwrap();
+        let server = "192.0.2.1:53".parse().unwrap();
+        let udp = provider.bind_udp(local, server).await.unwrap();
+        let quic = provider
+            .quic_binder()
+            .unwrap()
+            .bind_quic(local, server)
+            .unwrap();
+        owner.select("dns-route", "unavailable").unwrap();
+        assert!(provider.bind_udp(local, server).await.is_err());
+        assert!(
+            provider
+                .quic_binder()
+                .unwrap()
+                .bind_quic(local, server)
+                .is_err()
+        );
+        assert!(udp.local_addr().is_ok());
+        assert!(quic.local_addr().is_ok());
+        owner.select("dns-route", "usable").unwrap();
+        assert!(provider.bind_udp(local, server).await.is_ok());
+        assert!(
+            provider
+                .quic_binder()
+                .unwrap()
+                .bind_quic(local, server)
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn test_connect_tcp_with_direct_chain_connects_to_target() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -315,6 +366,256 @@ mod tests {
         let provider =
             ProxyRuntimeProvider::with_bootstrap(chain_group, resolver, TEST_CONNECT_TIMEOUT);
         assert!(provider.quic_binder().is_some());
+    }
+
+    fn run_quic_test_in_child(name: &str) -> bool {
+        if std::env::var("SHOES_DNS_QUIC_TEST_CHILD").as_deref() == Ok(name) {
+            crate::resources::configure(crate::config::GlobalLimits {
+                quic_memory_bytes: Some(16 << 20),
+                ..Default::default()
+            })
+            .unwrap();
+            return false;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("dns::proxy_runtime::tests::{name}"),
+                "--nocapture",
+            ])
+            .env("SHOES_DNS_QUIC_TEST_CHILD", name)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        true
+    }
+
+    #[tokio::test]
+    async fn quic_binder_keeps_candidate_reservation_without_publishing_limits() {
+        if run_quic_test_in_child(
+            "quic_binder_keeps_candidate_reservation_without_publishing_limits",
+        ) {
+            return;
+        }
+        let resolver = Arc::new(NativeResolver::new());
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            Arc::new(build_direct_chain_group(resolver.clone())),
+            resolver,
+            TEST_CONNECT_TIMEOUT,
+        )
+        .with_quic_memory(1 << 20);
+        assert_eq!(crate::resources::limits().quic_dns_memory_bytes, 16 << 20);
+        let binder = provider.quic_binder().unwrap();
+        let bind = || {
+            binder.bind_quic(
+                "0.0.0.0:0".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            )
+        };
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(512 << 10),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = bind().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert!(
+            error
+                .to_string()
+                .contains("requested 1048576 bytes, active 0 bytes, live cap 524288")
+        );
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(2 << 20),
+            ..Default::default()
+        })
+        .unwrap();
+        let socket = bind().unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            1 << 20
+        );
+        let second = bind().unwrap();
+        crate::resources::configure(crate::config::GlobalLimits {
+            quic_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            2 << 20
+        );
+        assert!(bind().is_err());
+        drop(second);
+        assert!(bind().is_err());
+        drop(socket);
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+        assert!(bind().is_ok());
+    }
+
+    #[tokio::test]
+    async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
+        if run_quic_test_in_child("quic_binder_reserves_shared_memory_until_last_socket_drop") {
+            return;
+        }
+        let binder = ProxyQuicBinder {
+            chain_group: Arc::new(build_direct_chain_group(Arc::new(NativeResolver::new()))),
+            memory_bytes: crate::resources::limits().quic_dns_memory_bytes,
+        };
+        let local_addr = "0.0.0.0:0".parse().unwrap();
+        let server_addr = "127.0.0.1:443".parse().unwrap();
+        let memory_bytes =
+            crate::resources::configure_quic_transport(&mut quinn::TransportConfig::default());
+        assert!(crate::resources::try_quic_memory(memory_bytes).is_some());
+        let socket = binder.bind_quic(local_addr, server_addr).unwrap();
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            16 << 20
+        );
+        assert!(crate::resources::try_quic_memory(memory_bytes).is_none());
+        assert_eq!(
+            binder
+                .bind_quic(local_addr, server_addr)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::ConnectionRefused,
+        );
+        let clone = socket.clone();
+        drop(socket);
+        assert_eq!(
+            crate::resources::snapshot().quic_buffer_bytes.active,
+            16 << 20
+        );
+        drop(clone);
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+
+        let occupied = std::net::UdpSocket::bind(local_addr).unwrap();
+        assert!(
+            binder
+                .bind_quic(occupied.local_addr().unwrap(), server_addr)
+                .is_err()
+        );
+        assert_eq!(crate::resources::snapshot().quic_buffer_bytes.active, 0);
+        assert!(binder.bind_quic(local_addr, server_addr).is_ok());
+    }
+
+    #[tokio::test]
+    async fn h3_lookup_uses_budgeted_socket_and_releases_it_on_teardown() {
+        use bytes::Buf;
+        use hickory_resolver::config::{
+            ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig,
+        };
+        use hickory_resolver::net::h3::h3_server::H3Server;
+        use hickory_resolver::proto::op::{Message, MessageType};
+        use hickory_resolver::proto::rr::{RData, Record, rdata::A};
+
+        if run_quic_test_in_child("h3_lookup_uses_budgeted_socket_and_releases_it_on_teardown") {
+            return;
+        }
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der())
+                    .into(),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut server = H3Server::with_socket_and_tls_config(
+            tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap(),
+            Arc::new(tls),
+        )
+        .unwrap();
+        let mut connection_config = ConnectionConfig::new(ProtocolConfig::H3 {
+            server_name: "localhost".into(),
+            path: "/dns-query".into(),
+            disable_grease: true,
+        });
+        connection_config.port = server.local_addr().unwrap().port();
+        let config = ResolverConfig::from_parts(
+            None,
+            vec![],
+            vec![NameServerConfig::new(
+                "127.0.0.1".parse().unwrap(),
+                true,
+                vec![connection_config],
+            )],
+        );
+        let bootstrap = Arc::new(NativeResolver::new());
+        let provider = ProxyRuntimeProvider::with_bootstrap(
+            Arc::new(build_direct_chain_group(bootstrap.clone())),
+            bootstrap,
+            Duration::from_secs(5),
+        );
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let resolver = hickory_resolver::Resolver::builder_with_config(config, provider)
+            .with_tls_config(tls)
+            .build()
+            .unwrap();
+        let answer = RData::A(A::new(192, 0, 2, 42));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let serve = async {
+            let (mut connection, _) = server.accept().await.unwrap().unwrap();
+            let (request, mut stream) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(request.uri().path(), "/dns-query");
+            let respond = async {
+                let mut body = Vec::new();
+                while let Some(mut data) = stream.recv_data().await.unwrap() {
+                    body.extend_from_slice(&data.copy_to_bytes(data.remaining()));
+                }
+                let mut response = Message::from_vec(&body).unwrap();
+                response.metadata.message_type = MessageType::Response;
+                response.add_answer(Record::from_rdata(
+                    response.queries[0].name().clone(),
+                    60,
+                    answer.clone(),
+                ));
+                let body = response.to_vec().unwrap();
+                stream
+                    .send_response(
+                        http::Response::builder()
+                            .header("content-type", "application/dns-message")
+                            .header("content-length", body.len())
+                            .body(())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                stream.send_data(body.into()).await.unwrap();
+                stream.finish().await.unwrap();
+                done_rx.await.unwrap();
+            };
+            tokio::select! {
+                _ = respond => {},
+                _ = connection.accept() => panic!("unexpected extra H3 request or closure"),
+            }
+        };
+        let lookup = async {
+            let result = resolver.ipv4_lookup("memory.test.").await.unwrap();
+            assert_eq!(result.answers()[0].data, answer);
+            assert_eq!(
+                crate::resources::snapshot().quic_buffer_bytes.active,
+                16 << 20
+            );
+            done_tx.send(()).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(serve, lookup)
+        })
+        .await
+        .unwrap();
+        drop((resolver, server));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while crate::resources::snapshot().quic_buffer_bytes.active != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

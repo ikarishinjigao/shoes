@@ -1,5 +1,6 @@
 use std::io::Cursor;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 
 use async_trait::async_trait;
 use rand::Rng;
@@ -148,7 +149,7 @@ impl ShadowTlsClientHandler {
                     &server_frame[TLS_HEADER_LEN + 4..TLS_HEADER_LEN + payload_len];
 
                 hmac_server_random.update(data_after_hmac);
-                if hmac_server_random.digest() != received_hmac {
+                if !bool::from(hmac_server_random.digest().ct_eq(received_hmac)) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "invalid HMAC for handshake data",
@@ -194,6 +195,14 @@ impl ShadowTlsClientHandler {
 
 #[async_trait]
 impl TcpClientHandler for ShadowTlsClientHandler {
+    async fn prepare_target(
+        &self,
+        target: ResolvedLocation,
+        resolver: &std::sync::Arc<dyn crate::resolver::Resolver>,
+    ) -> std::io::Result<ResolvedLocation> {
+        self.handler.prepare_target(target, resolver).await
+    }
+
     async fn setup_client_tcp_stream(
         &self,
         client_stream: Box<dyn AsyncStream>,
