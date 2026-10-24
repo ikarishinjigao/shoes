@@ -95,7 +95,7 @@ impl<S: AsyncMessageStream> VlessPacketAddrStream<S> {
         Self {
             stream,
             read_buffer: allocate_vec(MAX_MESSAGE_SIZE).into_boxed_slice(),
-            write_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
+            write_buffer: Vec::new(),
         }
     }
 }

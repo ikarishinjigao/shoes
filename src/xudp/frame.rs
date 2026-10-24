@@ -200,7 +200,7 @@ impl FrameMetadata {
             log::error!(
                 "[XUDP DECODE] Metadata too short: {} (buffer was {} bytes, first 8 bytes: {:?})",
                 metadata_len,
-                buf.len() + 2,
+                buf.len(),
                 &buf[..std::cmp::min(8, buf.len())]
             );
             return Err(std::io::Error::new(
@@ -222,9 +222,14 @@ impl FrameMetadata {
         let mut target = None;
 
         // Calculate remaining metadata bytes (after session_id, status, option = 4 bytes)
-        // New and Keep frames may carry a destination. Other trailing metadata is
-        // an extension (for example Xray's GlobalID) and is intentionally ignored.
-        if metadata.has_remaining() && matches!(status, SessionStatus::New | SessionStatus::Keep) {
+        // New frames always carry a destination. Like Xray, Keep frames only carry one
+        // for UDP; any other trailing metadata (for example Xray's GlobalID) is ignored.
+        let has_destination = match status {
+            SessionStatus::New => metadata.has_remaining(),
+            SessionStatus::Keep => metadata.first() == Some(&(TargetNetwork::Udp as u8)),
+            _ => false,
+        };
+        if has_destination {
             let net_byte = metadata.get_u8();
             network = Some(TargetNetwork::try_from(net_byte)?);
 
@@ -530,28 +535,27 @@ mod tests {
         assert_eq!(buf.len(), 0);
     }
 
-    /// Keep frames with destination metadata retain their declared network.
+    /// Keep frames only carry a destination for UDP; other trailing metadata is skipped.
     #[test]
-    fn test_decode_keep_frame_tcp_with_destination() {
+    fn test_decode_keep_frame_non_udp_extra_bytes() {
         let mut buf = BytesMut::new();
 
-        // Keep frame where network byte is 0x01 (TCP).
         let metadata_len: u16 = 4 + 1 + 2 + 1 + 4; // 12 bytes total
         buf.put_u16(metadata_len);
         buf.put_u16(50); // session_id
         buf.put_u8(0x02); // SessionStatus::Keep
         buf.put_u8(0x01); // FrameOption::DATA
-        buf.put_u8(0x01); // TargetNetwork::Tcp
-        buf.put_u16(443); // port
+        buf.put_u8(0x01); // TargetNetwork::Tcp (NOT UDP!)
+        buf.put_u16(443); // port (should be skipped)
         buf.put_u8(0x01); // address type
-        buf.put_slice(&[1, 2, 3, 4]); // address
+        buf.put_slice(&[1, 2, 3, 4]); // address (should be skipped)
 
         let decoded = FrameMetadata::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.session_id, 50);
         assert_eq!(decoded.status, SessionStatus::Keep);
-        assert_eq!(decoded.network, Some(TargetNetwork::Tcp));
-        assert_eq!(decoded.target.unwrap().port(), 443);
-        assert_eq!(buf.len(), 0);
+        assert!(decoded.network.is_none());
+        assert!(decoded.target.is_none());
+        assert_eq!(buf.len(), 0, "Extra bytes should be consumed");
     }
 
     #[test]

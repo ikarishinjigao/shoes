@@ -6,7 +6,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 
 use crate::address::{Address, NetLocation};
-use crate::async_stream::AsyncStream;
+use crate::async_stream::{AsyncMessageStream, AsyncStream};
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
 use crate::resolver::Resolver;
@@ -78,6 +78,33 @@ const SERVER_RESPONSE_HEADER: &[u8] = &[
     0u8, // version
     0u8, // addons length
 ];
+
+/// Builds the setup result for a VLESS UDP command. Mihomo's `packet-encoding: packet`
+/// targets a magic hostname and carries a destination in every message.
+fn udp_setup_result<S>(
+    remote_location: NetLocation,
+    vless_stream: VlessMessageStream<S>,
+    need_initial_flush: bool,
+    proxy_selector: Arc<ClientProxySelector>,
+) -> TcpServerSetupResult
+where
+    VlessMessageStream<S>: AsyncMessageStream + 'static,
+{
+    if is_packet_addr_location(&remote_location) {
+        TcpServerSetupResult::MultiDirectionalUdp {
+            stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
+            need_initial_flush,
+            proxy_selector,
+        }
+    } else {
+        TcpServerSetupResult::BidirectionalUdp {
+            remote_location,
+            stream: Box::new(vless_stream),
+            need_initial_flush,
+            proxy_selector,
+        }
+    }
+}
 
 /// Forward the connection to a fallback destination when VLESS authentication fails.
 ///
@@ -287,20 +314,12 @@ impl TcpServerHandler for VlessTcpServerHandler {
                     vless_stream.feed_initial_read_data(unparsed_data)?;
                 }
 
-                if is_packet_addr_location(&remote_location) {
-                    Ok(TcpServerSetupResult::MultiDirectionalUdp {
-                        stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
-                        need_initial_flush: self.encryption.is_some(),
-                        proxy_selector: self.proxy_selector.clone(),
-                    })
-                } else {
-                    Ok(TcpServerSetupResult::BidirectionalUdp {
-                        remote_location,
-                        stream: Box::new(vless_stream),
-                        need_initial_flush: self.encryption.is_some(),
-                        proxy_selector: self.proxy_selector.clone(),
-                    })
-                }
+                Ok(udp_setup_result(
+                    remote_location,
+                    vless_stream,
+                    self.encryption.is_some(),
+                    self.proxy_selector.clone(),
+                ))
             }
             COMMAND_MUX => {
                 if !self.udp_enabled {
@@ -475,20 +494,12 @@ async fn setup_vision_vless_server_stream<S: VisionTransport + 'static>(
                 vless_stream.feed_initial_read_data(unparsed_data)?;
             }
 
-            if is_packet_addr_location(&remote_location) {
-                Ok(TcpServerSetupResult::MultiDirectionalUdp {
-                    stream: Box::new(VlessPacketAddrStream::new(vless_stream)),
-                    need_initial_flush: native_encryption,
-                    proxy_selector: proxy_selector.clone(),
-                })
-            } else {
-                Ok(TcpServerSetupResult::BidirectionalUdp {
-                    remote_location,
-                    stream: Box::new(vless_stream),
-                    need_initial_flush: native_encryption,
-                    proxy_selector: proxy_selector.clone(),
-                })
-            }
+            Ok(udp_setup_result(
+                remote_location,
+                vless_stream,
+                native_encryption,
+                proxy_selector.clone(),
+            ))
         }
         COMMAND_MUX => {
             if !udp_enabled {

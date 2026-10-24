@@ -113,12 +113,16 @@ impl VisionUnpadder {
                     received_uuid.extend_from_slice(&data[..to_copy]);
                     data = &data[to_copy..];
 
-                    if received_uuid.len() < 16 {
+                    // Check if this is XTLS padding data. A mismatching prefix is decided
+                    // immediately so short non-Vision messages are not held back waiting
+                    // for bytes the peer may never send.
+                    let prefix_matches =
+                        received_uuid.as_slice() == &expected_uuid[..received_uuid.len()];
+                    if prefix_matches && received_uuid.len() < 16 {
                         return Ok(UnpadResult::default()); // Need more data
                     }
 
-                    // Check if this is XTLS padding data
-                    if received_uuid.as_slice() != expected_uuid {
+                    if !prefix_matches {
                         // Not XTLS padding data. Return the buffered prefix as well as this
                         // call's remaining bytes, then preserve passthrough behavior for every
                         // subsequent call.
@@ -450,20 +454,17 @@ mod tests {
         let user_uuid = [0u8; 16];
         let mut state = VisionUnpadder::new(user_uuid);
 
-        // Data that's less than 16 bytes (too short to check UUID)
-        let short_data = [1, 2, 3, 4, 5];
+        // A short read that still matches the UUID prefix is buffered.
+        let short_data = [0, 0, 0];
         let result = state.unpad(&short_data[..]).unwrap();
         assert!(result.content.is_empty()); // Need more data
         assert!(result.command.is_none());
 
-        // The second read completes a prefix that does not match the UUID. The bytes from
-        // both reads must be returned in order.
-        let non_xtls_data = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        // The second read diverges from the UUID. The bytes from both reads must be
+        // returned in order.
+        let non_xtls_data = [0, 5, 6];
         let result = state.unpad(&non_xtls_data).unwrap();
-        assert_eq!(
-            result.content,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-        );
+        assert_eq!(result.content, vec![0, 0, 0, 0, 5, 6]);
         assert_eq!(result.command, None);
         assert!(matches!(state.state, UnpadState::Passthrough));
 
@@ -472,6 +473,16 @@ mod tests {
         let result = state.unpad(&trailing_data).unwrap();
         assert_eq!(result.content, trailing_data);
         assert_eq!(result.command, None);
+    }
+
+    #[test]
+    fn test_short_mismatching_prefix_passes_through_immediately() {
+        let mut state = VisionUnpadder::new([7u8; 16]);
+
+        let result = state.unpad(&[1, 2, 3]).unwrap();
+        assert_eq!(result.content, vec![1, 2, 3]);
+        assert_eq!(result.command, None);
+        assert!(matches!(state.state, UnpadState::Passthrough));
     }
 
     #[test]

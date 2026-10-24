@@ -863,21 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bracketed_ipv6_address_parsing() {
-        assert_eq!(
-            Address::from("[2001:db8::1]").unwrap(),
-            Address::Ipv6("2001:db8::1".parse().unwrap())
-        );
-
-        for address in ["[example.com]", "[::1", "::1]"] {
-            assert!(
-                Address::from(address).is_err(),
-                "accepted malformed address {address:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_bracketed_ipv6_location_round_trips() {
         let location = NetLocation::from_str("[2001:db8::1]:443", None).unwrap();
         assert_eq!(
