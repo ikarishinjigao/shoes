@@ -79,12 +79,7 @@ jobs:
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-24.04
             use_cross: true
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-            use_cross: false
-          - target: aarch64-apple-darwin
-            os: macos-15
-            use_cross: false
+          # Fork: macOS targets are not built; hosted macOS runners queue for too long.
     env:
       TARGET: ${{ matrix.target }}
 
@@ -201,7 +196,7 @@ jobs:
       - name: Verify notices and checksum final archives
         run: |
           archives=(release-artifacts/shoes-*.tar.gz)
-          test "${#archives[@]}" -eq 8
+          test "${#archives[@]}" -eq 6
           for archive in "${archives[@]}"; do
             python3 scripts/check-release-notices.py "$archive"
           done
