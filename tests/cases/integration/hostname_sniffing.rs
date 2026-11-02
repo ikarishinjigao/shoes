@@ -93,7 +93,7 @@ async fn nested_tls_connect_inherits_fake_dns_and_sniff_but_uses_child_rules() -
             let mut ports = PortHelper::new();
             let (_, port) = ports.get_localhost_listener_port();
             let config = json!([
-                {"client_group":"exit", "client_proxies":[{"address":format!("127.0.0.1:{}", exit.local_addr()?.port()), "protocol":{"type":"socks"}}]},
+                {"client_group":"exit", "client_chains":[{"address":format!("127.0.0.1:{}", exit.local_addr()?.port()), "protocol":{"type":"socks"}}]},
                 {"address":format!("0.0.0.0:{port}"), "sniff":true,
                  "dns":{"fake_ip":fake, "servers":"udp://127.0.0.1:9"},
                  "rules":[{"mask":"0.0.0.0/0", "action":"block"}],
@@ -238,7 +238,7 @@ async fn fake_dns_sniff_case(
     let (_process, _config) = start_shoes_server(&format!(
         r#"
 - client_group: exit
-  client_proxies:
+  client_chains:
     - address: '127.0.0.1:{exit_port}'
       protocol: {{type: socks}}
 - address: '0.0.0.0:{port}'
@@ -269,10 +269,14 @@ async fn fake_dns_sniff_case(
         if let Err(error) = result {
             assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
         }
-        assert!(
-            reply.is_empty(),
-            "unknown fake address received an optimistic reply"
-        );
+        if protocol == "socks" {
+            assert_eq!(reply, [5, 4, 0, 1, 0, 0, 0, 0, 0, 0]);
+        } else {
+            assert!(
+                reply.is_empty(),
+                "unknown fake address received an optimistic reply"
+            );
+        }
     }
 
     // The same unknown address at port 53 must dispatch locally before restoration or rules.
@@ -459,10 +463,10 @@ async fn listener_config_case(
     )
     .await;
     if sniff != Some(true) {
-        assert!(
-            result.is_err(),
-            "disabled sniff unexpectedly matched a hostname rule"
-        );
+        let error = result.expect_err("disabled sniff unexpectedly matched a hostname rule");
+        if protocol == "socks" {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
         assert!(
             timeout(Duration::from_millis(20), target.accept())
                 .await

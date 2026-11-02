@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
@@ -12,9 +13,9 @@ use futures::future::FutureExt;
 use log::debug;
 use lru::LruCache;
 use parking_lot::Mutex;
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore, broadcast};
 
-use crate::address::{NetLocation, ResolvedLocation};
+use crate::address::{Address, NetLocation, ResolvedLocation};
 
 pub type ResolveFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
 pub type DnsExchangeFuture = Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>;
@@ -50,6 +51,7 @@ pub(crate) fn dns_setup_pending(error: &std::io::Error) -> bool {
 }
 
 const CACHING_NATIVE_RESOLVER_CACHE_CAPACITY: usize = 10_000;
+const CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS: usize = 1_024;
 const RESOLVER_CACHE_CAPACITY: usize = 1_024;
 
 /// Constructs a bounded LRU without eagerly reserving storage for every entry.
@@ -62,7 +64,7 @@ fn bounded_lru<K: Hash + Eq, V>(capacity: usize) -> LruCache<K, V> {
 pub trait Resolver: Send + Sync + Debug {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture;
 
-    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::DnsContext>> {
         None
     }
 
@@ -119,7 +121,7 @@ impl<T: Resolver> Debug for TimeoutResolver<T> {
 }
 
 impl<T: Resolver> Resolver for TimeoutResolver<T> {
-    fn fake_dns_context(&self) -> Option<Arc<crate::dns::fake_ip::FakeDnsContext>> {
+    fn fake_dns_context(&self) -> Option<Arc<crate::dns::DnsContext>> {
         self.inner.fake_dns_context()
     }
 
@@ -403,6 +405,9 @@ impl NativeResolver {
 
 impl Resolver for NativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
+        if let Some(bootstrap) = crate::socket_policy::bootstrap() {
+            return bootstrap.resolve_location(location);
+        }
         let address = location.address().clone();
         let port = location.port();
         Box::pin(
@@ -469,16 +474,109 @@ pub async fn resolve_location(
 }
 
 /// Native resolver with application-level caching.
-/// Uses tokio::net::lookup_host (OS resolver) with TTL-based cache.
-/// This is used as the default resolver when no DNS config is specified.
+/// Used by implicit native resolution and opt-in caching on explicit `system` entries.
+/// OS lookups expose no DNS TTL; successful results are reused for at most 60 seconds
+/// by default, measured from lookup completion. Errors and empty results are never cached.
+///
+/// At most 1,024 callers participate in coalesced misses (owners plus subscribers).
+/// Excess callers perform independent lookups, preserving existing failure
+/// semantics without adding an unbounded admission queue or detached tasks.
+/// Cancelling an owner makes surviving subscribers start a new lookup, which
+/// may exceed their remaining deadlines. Already-running OS calls cannot be stopped.
 pub struct CachingNativeResolver {
-    cache: Arc<parking_lot::Mutex<LruCache<NetLocation, CachedResolveResult>>>,
+    state: Arc<Mutex<NativeResolverState>>,
+    participants: Arc<Semaphore>,
+    lookup: Arc<dyn Resolver>,
     result_timeout_secs: u64,
 }
 
+type NativeLookupResult = Result<Arc<[SocketAddr]>, Arc<std::io::Error>>;
+
+struct NativeResolverState {
+    cache: LruCache<Address, CachedResolveResult>,
+    inflight: HashMap<Address, broadcast::Sender<NativeLookupResult>>,
+}
+
 struct CachedResolveResult {
-    timestamp: Instant,
-    addrs: Vec<SocketAddr>,
+    completed_at: tokio::time::Instant,
+    addrs: Arc<[SocketAddr]>,
+}
+
+impl NativeResolverState {
+    fn cached(&mut self, address: &Address, max_age: Duration) -> Option<Arc<[SocketAddr]>> {
+        if max_age.is_zero() {
+            return None;
+        }
+        if let Some(cached) = self.cache.get(address)
+            && cached.completed_at.elapsed() < max_age
+        {
+            return Some(cached.addrs.clone());
+        }
+        self.cache.pop(address);
+        None
+    }
+}
+
+struct NativeLookupOwner {
+    state: Arc<Mutex<NativeResolverState>>,
+    address: Address,
+    registered: bool,
+}
+
+enum NativeLookupRole {
+    Owner(NativeLookupOwner),
+    Subscriber(broadcast::Receiver<NativeLookupResult>),
+}
+
+impl NativeLookupOwner {
+    fn publish(mut self, result: &NativeLookupResult, cache_enabled: bool) {
+        let mut state = self.state.lock();
+        if cache_enabled && let Ok(addrs) = result {
+            state.cache.put(
+                self.address.clone(),
+                CachedResolveResult {
+                    completed_at: tokio::time::Instant::now(),
+                    addrs: addrs.clone(),
+                },
+            );
+        }
+        // Cache insertion and flight removal are atomic with subscription.
+        if self.registered {
+            let sender = state.inflight.remove(&self.address).unwrap();
+            // A panicking waker must not let Drop remove a replacement flight.
+            self.registered = false;
+            drop(state);
+            let _ = sender.send(result.clone());
+        }
+    }
+}
+
+impl Drop for NativeLookupOwner {
+    fn drop(&mut self) {
+        if self.registered {
+            // Closing outside the lock wakes subscribers to elect a replacement owner.
+            let sender = self.state.lock().inflight.remove(&self.address);
+            drop(sender);
+        }
+    }
+}
+
+fn native_addrs_with_port(addrs: &[SocketAddr], port: u16) -> Vec<SocketAddr> {
+    addrs
+        .iter()
+        .map(|addr| {
+            let mut addr = *addr;
+            addr.set_port(port);
+            addr
+        })
+        .collect()
+}
+
+fn native_lookup_error(error: Arc<std::io::Error>) -> std::io::Error {
+    match error.raw_os_error() {
+        Some(errno) => std::io::Error::from_raw_os_error(errno),
+        None => std::io::Error::new(error.kind(), error),
+    }
 }
 
 impl std::fmt::Debug for CachingNativeResolver {
@@ -490,17 +588,27 @@ impl std::fmt::Debug for CachingNativeResolver {
 }
 
 impl CachingNativeResolver {
-    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
+    /// Conservative application result age, not an authoritative DNS record TTL.
+    pub const DEFAULT_RESULT_TIMEOUT_SECS: u64 = 60;
 
     pub fn new() -> Self {
         Self::with_timeout(Self::DEFAULT_RESULT_TIMEOUT_SECS)
     }
 
+    /// Sets the maximum successful result age, not a lookup deadline or DNS TTL.
+    /// Zero disables completed-result caching but still coalesces concurrent misses.
     pub fn with_timeout(result_timeout_secs: u64) -> Self {
+        Self::with_lookup(Arc::new(NativeResolver::new()), result_timeout_secs)
+    }
+
+    pub(crate) fn with_lookup(lookup: Arc<dyn Resolver>, result_timeout_secs: u64) -> Self {
         Self {
-            cache: Arc::new(parking_lot::Mutex::new(bounded_lru(
-                CACHING_NATIVE_RESOLVER_CACHE_CAPACITY,
-            ))),
+            state: Arc::new(Mutex::new(NativeResolverState {
+                cache: bounded_lru(CACHING_NATIVE_RESOLVER_CACHE_CAPACITY),
+                inflight: HashMap::new(),
+            })),
+            participants: Arc::new(Semaphore::new(CACHING_NATIVE_RESOLVER_MAX_PARTICIPANTS)),
+            lookup,
             result_timeout_secs,
         }
     }
@@ -514,49 +622,90 @@ impl Default for CachingNativeResolver {
 
 impl Resolver for CachingNativeResolver {
     fn resolve_location(&self, location: &NetLocation) -> ResolveFuture {
-        // Check cache first
-        {
-            let mut cache = self.cache.lock();
-            if let Some(cached) = cache.get(location)
-                && Instant::now().duration_since(cached.timestamp)
-                    <= Duration::from_secs(self.result_timeout_secs)
-            {
-                let addrs = cached.addrs.clone();
-                return Box::pin(async move { Ok(addrs) });
-            }
-            cache.pop(location);
+        let max_age = Duration::from_secs(self.result_timeout_secs);
+        let cache_enabled = self.result_timeout_secs > 0;
+        let caller_port = location.port();
+        if let Some(addrs) = self.state.lock().cached(location.address(), max_age) {
+            let addrs = native_addrs_with_port(&addrs, caller_port);
+            return Box::pin(async move { Ok(addrs) });
         }
 
-        let location = location.clone();
-        let cache = self.cache.clone();
+        // Tokio's (host, u16) lookup delegates to std, which passes a null service
+        // to getaddrinfo and sets ports afterward. Only the exact host is a key;
+        // socket candidates retain order, duplicates, IPv6 scope IDs and flowinfo.
+        let query_location = NetLocation::new(location.address().clone(), 0);
+        let state = self.state.clone();
+        let participants = self.participants.clone();
+        let lookup = self.lookup.clone();
 
         Box::pin(async move {
-            let address = location.address().to_string();
-            let port = location.port();
+            let permit = participants.try_acquire().ok();
+            loop {
+                let role = {
+                    let mut locked = state.lock();
+                    // Rechecks after future creation or cancellation of an owner.
+                    if let Some(addrs) = locked.cached(query_location.address(), max_age) {
+                        return Ok(native_addrs_with_port(&addrs, caller_port));
+                    }
+                    if let Some(sender) = locked.inflight.get(query_location.address())
+                        && permit.is_some()
+                    {
+                        NativeLookupRole::Subscriber(sender.subscribe())
+                    } else {
+                        let registered = permit.is_some();
+                        if registered {
+                            let (sender, _) = broadcast::channel(1);
+                            locked
+                                .inflight
+                                .insert(query_location.address().clone(), sender);
+                        }
+                        NativeLookupRole::Owner(NativeLookupOwner {
+                            state: state.clone(),
+                            address: query_location.address().clone(),
+                            registered,
+                        })
+                    }
+                };
 
-            let result = tokio::net::lookup_host((address.clone(), port)).await?;
-            let addrs: Vec<SocketAddr> =
-                result.filter(|addr| !addr.ip().is_unspecified()).collect();
-
-            if addrs.is_empty() {
-                return Err(std::io::Error::other(format!(
-                    "DNS lookup returned no addresses for {address}"
-                )));
+                let result = match role {
+                    NativeLookupRole::Subscriber(mut subscriber) => match subscriber.recv().await {
+                        Ok(result) => result,
+                        Err(_) => continue,
+                    },
+                    NativeLookupRole::Owner(owner) => {
+                        let result = lookup
+                            .resolve_location(&query_location)
+                            .await
+                            .and_then(|mut addrs| {
+                                addrs.retain(|addr| !addr.ip().is_unspecified());
+                                if addrs.is_empty() {
+                                    Err(std::io::Error::other(format!(
+                                        "DNS lookup returned no addresses for {}",
+                                        query_location.address()
+                                    )))
+                                } else {
+                                    Ok(Arc::from(addrs))
+                                }
+                            })
+                            .map_err(Arc::new);
+                        owner.publish(&result, cache_enabled);
+                        result
+                    }
+                };
+                let addrs = result.map_err(native_lookup_error)?;
+                let addrs = native_addrs_with_port(&addrs, caller_port);
+                debug!(
+                    "CachingNativeResolver resolved {}:{caller_port} -> {addrs:?}",
+                    query_location.address()
+                );
+                return Ok(addrs);
             }
-
-            cache.lock().put(
-                location,
-                CachedResolveResult {
-                    timestamp: Instant::now(),
-                    addrs: addrs.clone(),
-                },
-            );
-
-            debug!("CachingNativeResolver resolved {address}:{port} -> {addrs:?}");
-            Ok(addrs)
         })
     }
 }
+
+#[cfg(test)]
+mod native_tests;
 
 /// Poll-based resolver cache for use in Future/Stream implementations.
 /// Wraps any Resolver and provides poll_resolve_location for manual polling.
@@ -672,719 +821,4 @@ impl ResolverCache {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::address::Address;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Barrier;
-
-    /// A mock resolver that returns configurable results, tracking call count.
-    #[derive(Debug)]
-    struct MockResolver {
-        addrs: Vec<SocketAddr>,
-        call_count: AtomicUsize,
-        error_kind: Option<std::io::ErrorKind>,
-    }
-
-    impl MockResolver {
-        fn with_addrs(addrs: Vec<SocketAddr>) -> Self {
-            Self {
-                addrs,
-                call_count: AtomicUsize::new(0),
-                error_kind: None,
-            }
-        }
-
-        fn with_error(kind: std::io::ErrorKind) -> Self {
-            Self {
-                addrs: vec![],
-                call_count: AtomicUsize::new(0),
-                error_kind: Some(kind),
-            }
-        }
-    }
-
-    impl Resolver for MockResolver {
-        fn exchange(&self, request: Vec<u8>) -> DnsExchangeFuture {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            let error = self.error_kind;
-            Box::pin(async move {
-                match error {
-                    Some(kind) => Err(std::io::Error::new(kind, "mock exchange error")),
-                    None => Ok(request),
-                }
-            })
-        }
-
-        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
-            self.call_count.fetch_add(1, Ordering::Relaxed);
-            let addrs = self.addrs.clone();
-            let error_kind = self.error_kind;
-            Box::pin(async move {
-                if let Some(kind) = error_kind {
-                    Err(std::io::Error::new(kind, "mock error"))
-                } else {
-                    Ok(addrs)
-                }
-            })
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct PendingResolver {
-        active: Arc<AtomicUsize>,
-        calls: AtomicUsize,
-    }
-
-    struct PendingFuture {
-        active: Arc<AtomicUsize>,
-    }
-
-    impl Future for PendingFuture {
-        type Output = std::io::Result<Vec<SocketAddr>>;
-
-        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-            Poll::Pending
-        }
-    }
-
-    impl Drop for PendingFuture {
-        fn drop(&mut self) {
-            self.active.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    impl Resolver for PendingResolver {
-        fn resolve_location(&self, _location: &NetLocation) -> ResolveFuture {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            self.active.fetch_add(1, Ordering::Relaxed);
-            Box::pin(PendingFuture {
-                active: self.active.clone(),
-            })
-        }
-    }
-
-    fn test_location() -> NetLocation {
-        NetLocation::new(Address::Hostname("example.com".to_string()), 80)
-    }
-
-    #[tokio::test]
-    async fn exchange_propagates_timeout_and_refreshes_once() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let builds = calls.clone();
-        let factory: ResolverFactory = Arc::new(move || {
-            let generation = builds.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                let resolver = if generation == 0 {
-                    MockResolver::with_error(std::io::ErrorKind::TimedOut)
-                } else {
-                    MockResolver::with_addrs(vec![])
-                };
-                Ok(Arc::new(resolver) as Arc<dyn Resolver>)
-            })
-        });
-        let resolver = RefreshingResolver::new(
-            factory,
-            RefreshPolicy {
-                max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
-            },
-            "exchange".into(),
-        )
-        .await
-        .unwrap();
-        let resolver = TimeoutResolver::with_timeout(resolver, Duration::from_secs(1));
-        assert_eq!(resolver.exchange(vec![1, 2]).await.unwrap(), vec![1, 2]);
-        assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
-        assert!(
-            resolver
-                .inner
-                .refresh_state
-                .lock()
-                .last_activity_at
-                .is_some()
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exchange_deadline_handles_an_unbounded_configured_timeout() {
-        let resolver =
-            TimeoutResolver::with_timeout(MockResolver::with_addrs(vec![]), Duration::MAX);
-        assert_eq!(
-            resolver
-                .exchange_with_deadline(
-                    vec![1],
-                    tokio::time::Instant::now() + Duration::from_secs(1)
-                )
-                .await
-                .unwrap(),
-            vec![1]
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exchange_deadline_completion_is_not_raced_by_a_refresh_timer() {
-        #[derive(Debug)]
-        struct DeadlineReply(bool);
-        impl Resolver for DeadlineReply {
-            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
-                unreachable!()
-            }
-            fn exchange_with_deadline(
-                &self,
-                request: Vec<u8>,
-                deadline: tokio::time::Instant,
-            ) -> DnsExchangeFuture {
-                let fail = self.0;
-                Box::pin(async move {
-                    tokio::time::sleep_until(deadline).await;
-                    // Model a leaf timer wake delivered after an enclosing timer's wake batch.
-                    tokio::task::yield_now().await;
-                    if fail {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            DnsSetupPending,
-                        ))
-                    } else {
-                        Ok(request)
-                    }
-                })
-            }
-        }
-        for fail in [false, true] {
-            let builds = Arc::new(AtomicUsize::new(0));
-            let calls = builds.clone();
-            let factory: ResolverFactory = Arc::new(move || {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async move { Ok(Arc::new(DeadlineReply(fail)) as Arc<dyn Resolver>) })
-            });
-            let resolver = RefreshingResolver::new(
-                factory,
-                RefreshPolicy {
-                    max_idle: Duration::from_secs(60),
-                    retry_once_after_refresh: true,
-                },
-                "deadline completion".into(),
-            )
-            .await
-            .unwrap();
-            let reply = resolver
-                .exchange_with_deadline(
-                    vec![1],
-                    tokio::time::Instant::now() + Duration::from_millis(10),
-                )
-                .await;
-            if fail {
-                assert!(dns_setup_pending(&reply.unwrap_err()));
-            } else {
-                assert_eq!(reply.unwrap(), vec![1]);
-            }
-            assert_eq!(builds.load(Ordering::Relaxed), 1);
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exchange_deadline_also_bounds_refresh_factory_and_lock_waits() {
-        for hold_lock in [false, true] {
-            let builds = Arc::new(AtomicUsize::new(0));
-            let calls = builds.clone();
-            let factory: ResolverFactory = Arc::new(move || {
-                let generation = calls.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async move {
-                    if generation > 0 {
-                        std::future::pending::<()>().await;
-                    }
-                    Ok(Arc::new(MockResolver::with_error(
-                        std::io::ErrorKind::ConnectionReset,
-                    )) as Arc<dyn Resolver>)
-                })
-            });
-            let resolver = RefreshingResolver::new(
-                factory,
-                RefreshPolicy {
-                    max_idle: Duration::from_secs(60),
-                    retry_once_after_refresh: true,
-                },
-                "deadline".into(),
-            )
-            .await
-            .unwrap();
-            let _guard = if hold_lock {
-                Some(resolver.refresh_lock.lock().await)
-            } else {
-                None
-            };
-            let started = tokio::time::Instant::now();
-            let error = resolver
-                .exchange_with_deadline(vec![], started + Duration::from_secs(1))
-                .await
-                .unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-            assert_eq!(started.elapsed(), Duration::from_secs(1));
-            assert_eq!(
-                builds.load(Ordering::Relaxed),
-                if hold_lock { 1 } else { 2 }
-            );
-        }
-    }
-
-    fn test_addrs() -> Vec<SocketAddr> {
-        vec!["127.0.0.1:80".parse().unwrap()]
-    }
-
-    #[tokio::test]
-    async fn failed_setup_retry_refreshes_only_for_future_requests() {
-        #[derive(Debug)]
-        struct SetupFailureResolver {
-            calls: AtomicUsize,
-            second_error: Option<std::io::ErrorKind>,
-        }
-        impl Resolver for SetupFailureResolver {
-            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
-                unreachable!()
-            }
-
-            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
-                let call = self.calls.fetch_add(1, Ordering::Relaxed);
-                let second_error = self.second_error;
-                Box::pin(async move {
-                    if call > 0
-                        && let Some(kind) = second_error
-                    {
-                        return Err(std::io::Error::new(kind, "retry failure"));
-                    }
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        DnsSetupPending,
-                    ))
-                })
-            }
-        }
-
-        for (second_error, factory_fails) in [
-            (None, false),
-            (Some(std::io::ErrorKind::TimedOut), false),
-            (Some(std::io::ErrorKind::InvalidData), false),
-            (None, true),
-        ] {
-            let initial = Arc::new(SetupFailureResolver {
-                calls: AtomicUsize::new(0),
-                second_error,
-            });
-            let builds = Arc::new(AtomicUsize::new(0));
-            let factory: ResolverFactory = {
-                let initial = initial.clone();
-                let builds = builds.clone();
-                Arc::new(move || {
-                    let generation = builds.fetch_add(1, Ordering::Relaxed);
-                    let initial = initial.clone();
-                    Box::pin(async move {
-                        if generation == 0 {
-                            Ok(initial as Arc<dyn Resolver>)
-                        } else if factory_fails {
-                            Err(std::io::Error::other("factory failed"))
-                        } else {
-                            Ok(Arc::new(MockResolver::with_addrs(vec![])) as Arc<dyn Resolver>)
-                        }
-                    })
-                })
-            };
-            let resolver = RefreshingResolver::new(
-                factory,
-                RefreshPolicy {
-                    max_idle: Duration::from_secs(60),
-                    retry_once_after_refresh: true,
-                },
-                "failed retained setup".into(),
-            )
-            .await
-            .unwrap();
-            let error = resolver.exchange(vec![]).await.unwrap_err();
-            assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
-            assert!(resolver.refresh_state.lock().last_activity_at.is_none());
-            assert_eq!(dns_setup_pending(&error), second_error.is_none());
-            assert_eq!(
-                error.kind(),
-                second_error.unwrap_or(std::io::ErrorKind::TimedOut)
-            );
-            let refreshable = RefreshingResolver::should_refresh_for_error(&error);
-            assert_eq!(builds.load(Ordering::Relaxed), 1 + usize::from(refreshable));
-            if refreshable && !factory_fails {
-                assert_eq!(resolver.exchange(vec![3]).await.unwrap(), vec![3]);
-                assert_eq!(initial.calls.load(Ordering::Relaxed), 2);
-                assert_eq!(builds.load(Ordering::Relaxed), 2);
-            }
-        }
-    }
-
-    fn unique_location(index: usize) -> NetLocation {
-        NetLocation::new(Address::Hostname(format!("host-{index}.example")), 443)
-    }
-
-    #[tokio::test]
-    async fn concurrent_setup_retries_do_not_attempt_again_after_generation_changes() {
-        #[derive(Debug, Default)]
-        struct SetupFailureResolver(AtomicUsize);
-        impl Resolver for SetupFailureResolver {
-            fn resolve_location(&self, _: &NetLocation) -> ResolveFuture {
-                unreachable!()
-            }
-
-            fn exchange(&self, _: Vec<u8>) -> DnsExchangeFuture {
-                self.0.fetch_add(1, Ordering::Relaxed);
-                Box::pin(async {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        DnsSetupPending,
-                    ))
-                })
-            }
-        }
-        let initial = Arc::new(SetupFailureResolver::default());
-        let fresh = Arc::new(MockResolver::with_addrs(vec![]));
-        let builds = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let factory: ResolverFactory = {
-            let (initial, fresh, builds, gate) =
-                (initial.clone(), fresh.clone(), builds.clone(), gate.clone());
-            Arc::new(move || {
-                let generation = builds.fetch_add(1, Ordering::Relaxed);
-                let (initial, fresh, gate) = (initial.clone(), fresh.clone(), gate.clone());
-                Box::pin(async move {
-                    if generation == 0 {
-                        Ok(initial as Arc<dyn Resolver>)
-                    } else {
-                        let _permit = gate.acquire().await.unwrap();
-                        Ok(fresh as Arc<dyn Resolver>)
-                    }
-                })
-            })
-        };
-        let resolver = RefreshingResolver::new(
-            factory,
-            RefreshPolicy {
-                max_idle: Duration::from_secs(60),
-                retry_once_after_refresh: true,
-            },
-            "concurrent retained setup retries".into(),
-        )
-        .await
-        .unwrap();
-        let mut first = resolver.exchange(vec![]);
-        let mut second = resolver.exchange(vec![]);
-        assert!(futures::poll!(&mut first).is_pending());
-        assert!(futures::poll!(&mut second).is_pending());
-        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
-        assert_eq!(builds.load(Ordering::Relaxed), 2);
-        gate.add_permits(1);
-        assert!(dns_setup_pending(&first.await.unwrap_err()));
-        assert!(dns_setup_pending(&second.await.unwrap_err()));
-        assert_eq!(initial.0.load(Ordering::Relaxed), 4);
-        assert_eq!(fresh.call_count.load(Ordering::Relaxed), 0);
-        assert_eq!(builds.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn test_caching_native_resolver_cache_is_bounded() {
-        let resolver = CachingNativeResolver::new();
-        let mut cache = resolver.cache.lock();
-
-        for index in 0..CACHING_NATIVE_RESOLVER_CACHE_CAPACITY + 1 {
-            cache.put(
-                unique_location(index),
-                CachedResolveResult {
-                    timestamp: Instant::now(),
-                    addrs: vec!["127.0.0.1:443".parse().unwrap()],
-                },
-            );
-        }
-
-        assert_eq!(cache.len(), CACHING_NATIVE_RESOLVER_CACHE_CAPACITY);
-        assert!(cache.peek(&unique_location(0)).is_none());
-    }
-
-    #[tokio::test]
-    async fn native_cache_preserves_all_candidates_and_order() {
-        let resolver = CachingNativeResolver::new();
-        let location = test_location();
-        let addrs = vec![
-            "[2001:db8::1]:80".parse().unwrap(),
-            "192.0.2.1:80".parse().unwrap(),
-            "192.0.2.2:80".parse().unwrap(),
-        ];
-        resolver.cache.lock().put(
-            location.clone(),
-            CachedResolveResult {
-                timestamp: Instant::now(),
-                addrs: addrs.clone(),
-            },
-        );
-        let mut result = resolver.resolve_location(&location).await.unwrap();
-        assert_eq!(result, addrs);
-        result.clear();
-        assert_eq!(resolver.resolve_location(&location).await.unwrap(), addrs);
-    }
-
-    #[tokio::test]
-    async fn native_cache_expires_and_stores_the_complete_cold_result() {
-        let resolver = CachingNativeResolver::with_timeout(1);
-        let location = NetLocation::from_str("127.0.0.1:80", None).unwrap();
-        resolver.cache.lock().put(
-            location.clone(),
-            CachedResolveResult {
-                timestamp: Instant::now() - Duration::from_secs(2),
-                addrs: vec!["192.0.2.1:80".parse().unwrap()],
-            },
-        );
-        let cold = resolver.resolve_location(&location).await.unwrap();
-        assert_eq!(cold, vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()]);
-        assert_eq!(resolver.cache.lock().peek(&location).unwrap().addrs, cold);
-        assert_eq!(resolver.resolve_location(&location).await.unwrap(), cold);
-    }
-
-    #[tokio::test]
-    async fn test_resolver_cache_is_bounded() {
-        let resolver: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(test_addrs()));
-        let mut cache = ResolverCache::new(resolver);
-
-        for index in 0..RESOLVER_CACHE_CAPACITY + 1 {
-            cache
-                .resolve_location(&unique_location(index))
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(cache.cache.len(), RESOLVER_CACHE_CAPACITY);
-        assert!(cache.cache.peek(&unique_location(0)).is_none());
-    }
-
-    #[test]
-    fn test_resolver_cache_cancels_abandoned_pending_result() {
-        let resolver = Arc::new(PendingResolver::default());
-        let mut cache = ResolverCache::new(resolver.clone());
-        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
-        let first = unique_location(0);
-        let second = unique_location(1);
-
-        assert!(matches!(
-            cache.poll_resolve_location(&mut cx, &first),
-            Poll::Pending
-        ));
-        assert_eq!(resolver.active.load(Ordering::Relaxed), 1);
-
-        assert!(matches!(
-            cache.poll_resolve_location(&mut cx, &second),
-            Poll::Pending
-        ));
-        assert_eq!(resolver.active.load(Ordering::Relaxed), 1);
-        assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
-
-        assert!(matches!(
-            cache.poll_resolve_location(&mut cx, &second),
-            Poll::Pending
-        ));
-        assert_eq!(resolver.calls.load(Ordering::Relaxed), 2);
-
-        let literal = NetLocation::new(Address::Ipv4(std::net::Ipv4Addr::LOCALHOST), 443);
-        assert!(matches!(
-            cache.poll_resolve_location(&mut cx, &literal),
-            Poll::Ready(Ok(_))
-        ));
-        assert_eq!(resolver.active.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_refreshing_resolver_retries_after_timeout() {
-        let success_addrs = test_addrs();
-        let call_count = Arc::new(AtomicUsize::new(0));
-
-        let call_count_clone = call_count.clone();
-        let addrs = success_addrs.clone();
-        let factory: ResolverFactory = Arc::new(move || {
-            let n = call_count_clone.fetch_add(1, Ordering::Relaxed);
-            let addrs = addrs.clone();
-            Box::pin(async move {
-                if n == 0 {
-                    // First build: return a resolver that times out
-                    Ok(
-                        Arc::new(MockResolver::with_error(std::io::ErrorKind::TimedOut))
-                            as Arc<dyn Resolver>,
-                    )
-                } else {
-                    // Refresh build: return a resolver that succeeds
-                    Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
-                }
-            })
-        });
-
-        let policy = RefreshPolicy {
-            max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
-        };
-
-        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
-            .await
-            .unwrap();
-
-        let result = resolver.resolve_location(&test_location()).await.unwrap();
-        assert_eq!(result, success_addrs);
-        // Factory called twice: initial build + refresh-on-error
-        assert_eq!(call_count.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn test_refreshing_resolver_no_retry_on_non_refreshable_error() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-
-        let call_count_clone = call_count.clone();
-        let factory: ResolverFactory = Arc::new(move || {
-            call_count_clone.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                // Return a resolver that returns a non-refreshable error
-                Ok(
-                    Arc::new(MockResolver::with_error(std::io::ErrorKind::Other))
-                        as Arc<dyn Resolver>,
-                )
-            })
-        });
-
-        let policy = RefreshPolicy {
-            max_idle: Duration::from_secs(60),
-            retry_once_after_refresh: true,
-        };
-
-        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
-            .await
-            .unwrap();
-
-        let result = resolver.resolve_location(&test_location()).await;
-        assert!(result.is_err());
-        // Factory called only once (initial build, no refresh for non-refreshable errors)
-        assert_eq!(call_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_refreshing_resolver_idle_refresh() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let addrs = test_addrs();
-
-        let call_count_clone = call_count.clone();
-        let addrs_clone = addrs.clone();
-        let factory: ResolverFactory = Arc::new(move || {
-            call_count_clone.fetch_add(1, Ordering::Relaxed);
-            let addrs = addrs_clone.clone();
-            Box::pin(
-                async move { Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>) },
-            )
-        });
-
-        let policy = RefreshPolicy {
-            max_idle: Duration::from_millis(50),
-            retry_once_after_refresh: true,
-        };
-
-        let resolver = RefreshingResolver::new(factory, policy, "test".to_string())
-            .await
-            .unwrap();
-
-        // First resolve records activity.
-        let result = resolver.resolve_location(&test_location()).await.unwrap();
-        assert_eq!(result, addrs);
-        assert_eq!(call_count.load(Ordering::Relaxed), 1);
-
-        // Wait for idle timeout
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Second resolve triggers idle refresh
-        let result = resolver.resolve_location(&test_location()).await.unwrap();
-        assert_eq!(result, addrs);
-        // Factory called twice: initial + idle refresh
-        assert_eq!(call_count.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn test_refreshing_resolver_coalesces_concurrent_idle_refresh() {
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let addrs = test_addrs();
-
-        let call_count_clone = call_count.clone();
-        let addrs_clone = addrs.clone();
-        let factory: ResolverFactory = Arc::new(move || {
-            call_count_clone.fetch_add(1, Ordering::Relaxed);
-            let addrs = addrs_clone.clone();
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                Ok(Arc::new(MockResolver::with_addrs(addrs)) as Arc<dyn Resolver>)
-            })
-        });
-
-        let policy = RefreshPolicy {
-            max_idle: Duration::from_millis(20),
-            retry_once_after_refresh: true,
-        };
-
-        let resolver = Arc::new(
-            RefreshingResolver::new(factory, policy, "test".to_string())
-                .await
-                .unwrap(),
-        );
-
-        let result = resolver.resolve_location(&test_location()).await.unwrap();
-        assert_eq!(result, addrs);
-        assert_eq!(call_count.load(Ordering::Relaxed), 1);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let concurrency = 32;
-        let barrier = Arc::new(Barrier::new(concurrency));
-        let tasks = (0..concurrency).map(|_| {
-            let resolver = resolver.clone();
-            let barrier = barrier.clone();
-            let location = test_location();
-            tokio::spawn(async move {
-                barrier.wait().await;
-                resolver.resolve_location(&location).await
-            })
-        });
-
-        for result in futures::future::join_all(tasks).await {
-            assert_eq!(result.unwrap().unwrap(), addrs);
-        }
-        assert_eq!(call_count.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_addresses_returns_all() {
-        let addrs: Vec<SocketAddr> = vec![
-            "1.1.1.1:80".parse().unwrap(),
-            "2.2.2.2:80".parse().unwrap(),
-            "3.3.3.3:80".parse().unwrap(),
-        ];
-        let inner: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(addrs.clone()));
-        let loc = test_location();
-
-        let result = resolve_addresses(&inner, &loc).await.unwrap();
-        assert_eq!(result, addrs);
-    }
-
-    #[tokio::test]
-    async fn test_resolve_addresses_ip_literal() {
-        let inner: Arc<dyn Resolver> = Arc::new(MockResolver::with_addrs(vec![]));
-        let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 443);
-
-        let result = resolve_addresses(&inner, &loc).await.unwrap();
-        assert_eq!(result, vec!["1.2.3.4:443".parse::<SocketAddr>().unwrap()]);
-    }
-
-    #[tokio::test]
-    async fn test_timeout_resolver_ip_bypass() {
-        let inner = MockResolver::with_addrs(test_addrs());
-        let resolver = TimeoutResolver::with_timeout(inner, Duration::from_millis(1));
-
-        // IP literals should return immediately without timeout
-        let loc = NetLocation::new(Address::Ipv4("1.2.3.4".parse().unwrap()), 80);
-        let result = resolver.resolve_location(&loc).await.unwrap();
-        assert_eq!(result[0], "1.2.3.4:80".parse::<SocketAddr>().unwrap());
-    }
-}
+mod tests;

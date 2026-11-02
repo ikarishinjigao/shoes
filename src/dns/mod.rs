@@ -10,8 +10,11 @@
 //! TCP-based protocols (tcp://, tls://, https://) support routing through
 //! proxy chains via the ProxyRuntimeProvider.
 
+#[cfg(target_os = "linux")]
+mod bootstrap;
 mod builder;
 mod composite_resolver;
+mod context;
 mod exchange;
 pub mod fake_ip;
 mod guard;
@@ -19,9 +22,20 @@ mod hickory_resolver;
 mod message;
 mod parsed;
 mod proxy_runtime;
+mod stream;
 mod system;
+#[allow(
+    dead_code,
+    reason = "staged adapter; global tendns policy is not activated yet"
+)]
+mod tendns_resolver;
 
-pub(crate) use guard::real_only;
+#[cfg(target_os = "linux")]
+pub(crate) use bootstrap::controlled as controlled_bootstrap;
+pub(crate) use builder::check_interception;
+pub use context::{DnsContext, FakeDnsResolver};
+
+pub(crate) use guard::{SyntheticDnsAnswer, real_only};
 
 /// Binds a TCP listener and a UDP socket on one loopback port, as DNS servers listen. A
 /// free TCP port does not imply a free UDP port, so retry with new ports.

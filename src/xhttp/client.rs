@@ -15,7 +15,7 @@ use super::{
 };
 use crate::{
     address::NetLocation,
-    config::xhttp::{MAX_PADDING_BYTES, XhttpClientConfig, XhttpMode, XhttpVersion},
+    config::xhttp::{MAX_PADDING_BYTES, ResolvedXhttpClientConfig, XhttpMode, XhttpVersion},
     resources::Budget,
     tcp::carrier_dialer::{CarrierDialer, RouteKey},
 };
@@ -115,13 +115,14 @@ impl Lease {
 }
 
 pub struct Client {
-    config: XhttpClientConfig,
+    config: ResolvedXhttpClientConfig,
     endpoint: NetLocation,
     authority: String,
     path: Path,
     version: XhttpVersion,
     mode: XhttpMode,
     security: Security,
+    masks: Vec<Arc<crate::sudoku_mask::Prepared>>,
     memory: Arc<Budget>,
     admission: Arc<Budget>,
     tasks: Tasks,
@@ -146,7 +147,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     pub fn new(
-        config: XhttpClientConfig,
+        config: ResolvedXhttpClientConfig,
         endpoint: NetLocation,
         authority: String,
         version: XhttpVersion,
@@ -170,6 +171,7 @@ impl Client {
             version,
             mode,
             security,
+            masks: Vec::new(),
             slots: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -193,6 +195,11 @@ impl Client {
         });
     }
 
+    pub(super) fn with_masks(mut self, masks: Vec<Arc<crate::sudoku_mask::Prepared>>) -> Self {
+        self.masks = masks;
+        self
+    }
+
     async fn dial(&self, dialer: &Arc<dyn CarrierDialer>) -> io::Result<Arc<Carrier>> {
         let header_limit = 8192 + MAX_PADDING_BYTES as usize;
         tokio::time::timeout(
@@ -201,10 +208,20 @@ impl Client {
                 if self.version == XhttpVersion::H3 {
                     Carrier::quic(dialer.open_quic().await?, header_limit).await
                 } else {
+                    let mut stream = dialer.open_stream().await?;
+                    for config in &self.masks {
+                        stream = Box::new(crate::sudoku_mask::SudokuStream::new(
+                            stream,
+                            config.clone(),
+                            crate::sudoku_mask::Role::Client,
+                        ));
+                    }
+                    let stream = self
+                        .security
+                        .wrap(stream, &self.endpoint, self.version)
+                        .await?;
                     Carrier::tcp_with_windows(
-                        self.security
-                            .wrap(dialer.open_stream().await?, &self.endpoint, self.version)
-                            .await?,
+                        stream,
                         self.version,
                         header_limit,
                         self.config.limits.h2_windows(),
@@ -789,8 +806,52 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sudoku_mask_carriers_preserve_security_scheme_and_disabled_sni() {
+        let resolver: Arc<dyn crate::resolver::Resolver> =
+            Arc::new(crate::resolver::NativeResolver::new());
+        let xhttp = json!({"type":"xhttp","protocol":{"type":"socks"}});
+        let mask = |protocol| json!({"type":"sudoku_mask","protocol":protocol});
+        for (protocol, secure, count) in [
+            (mask(xhttp.clone()), false, 1),
+            (mask(mask(xhttp.clone())), false, 2),
+            (mask(json!({"type":"tls","protocol":xhttp})), true, 1),
+            (mask(mask(json!({"type":"tls","protocol":xhttp}))), true, 2),
+        ] {
+            let config = crate::config::test_support::from_json(
+                json!({"address":"origin.example:443","protocol":protocol}),
+            )
+            .unwrap();
+            let (client, _) = super::super::connector::build(&config, resolver.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(client.masks.len(), count);
+            let request = client.request("session", None, false, Body::Empty).unwrap();
+            assert_eq!(
+                request.uri().scheme_str(),
+                Some(if secure { "https" } else { "http" })
+            );
+            if let Security::Tls { name, .. } = &client.security {
+                assert_eq!(name.to_str(), "origin.example");
+            }
+        }
+        let config = crate::config::test_support::from_json(
+            json!({"address":"origin.example:443","protocol":mask(json!({
+            "type":"tls","sni_hostname":null,"protocol":xhttp}))}),
+        )
+        .unwrap();
+        let (client, _) = super::super::connector::build(&config, resolver)
+            .unwrap()
+            .unwrap();
+        let Security::Tls { config, .. } = &client.security else {
+            panic!("expected TLS")
+        };
+        assert!(!config.enable_sni);
+    }
+
+    #[test]
     fn default_client_admission_is_uncapped() {
-        let config = serde_json::from_value(json!({"protocol": {"type": "socks"}})).unwrap();
+        let config =
+            crate::config::test_support::from_json(json!({"protocol": {"type": "socks"}})).unwrap();
         let client = Client::new(
             config,
             NetLocation::from_str("localhost:443", None).unwrap(),
@@ -861,7 +922,7 @@ mod tests {
                     .unwrap();
                 while let Ok(Some(_)) = driver.accept().await {}
             });
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "pool":{"max_connections":1},"protocol":{"type":"socks"}
             }))
             .unwrap();
@@ -944,7 +1005,7 @@ mod tests {
                 opens: std::sync::atomic::AtomicUsize::new(0),
             });
             let route: Arc<dyn CarrierDialer> = dialer.clone();
-            let config = serde_json::from_value(json!({
+            let config = crate::config::test_support::from_json(json!({
                 "sc_max_each_post_bytes":1,"sc_min_posts_interval_ms":1,
                 "pool":{"max_connections":2},"protocol":{"type":"socks"}
             }))
@@ -1006,7 +1067,7 @@ mod tests {
             ),
         ] {
             for (version, alpn) in [("h1", b"http/1.1".as_slice()), ("h2", b"h2")] {
-                let config = serde_json::from_value(json!({
+                let config = crate::config::test_support::from_json(json!({
                     "address":"localhost:443", "protocol":{
                         "type":"tls", "verify":false, "key_exchange_groups":groups,
                         "protocol":{"type":"xhttp", "http_version":version,

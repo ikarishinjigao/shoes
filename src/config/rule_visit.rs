@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{Config, ConfigSelection, RuleConfig, RuleGroupRules, ServerProxyConfig};
+use super::{Config, ConfigSelection, RuleConfig, ServerProxyConfig};
 use crate::option_util::NoneOrSome;
 use crate::rules::Compiler;
 
@@ -31,18 +31,19 @@ fn protocol(
             reality_targets,
             ..
         } => {
-            for target in tls_targets
-                .values_mut()
-                .chain(default_tls_target.iter_mut().map(|t| t.as_mut()))
-            {
+            for (_, target) in super::client_visit::sorted_targets(tls_targets) {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
-            for target in shadowtls_targets.values_mut() {
+            if let Some(target) = default_tls_target {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
-            for target in reality_targets.values_mut() {
+            for (_, target) in super::client_visit::sorted_targets(shadowtls_targets) {
+                rules(&mut target.override_rules, visitor, group)?;
+                self::protocol(&mut target.protocol, visitor, group)?;
+            }
+            for (_, target) in super::client_visit::sorted_targets(reality_targets) {
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
@@ -52,6 +53,9 @@ fn protocol(
                 rules(&mut target.override_rules, visitor, group)?;
                 self::protocol(&mut target.protocol, visitor, group)?;
             }
+        }
+        ServerProxyConfig::SudokuMask(config) => {
+            self::protocol(&mut config.protocol, visitor, group)?
         }
         ServerProxyConfig::Xhttp(config) => self::protocol(&mut config.protocol, visitor, group)?,
         _ => {}
@@ -76,10 +80,8 @@ pub(crate) fn visit(
             }
             Config::TunServer(tun) => rules(&mut tun.rules, visitor, group)?,
             Config::RuleConfigGroup(group) => {
-                if let RuleGroupRules::Policies(rules) = &mut group.rules {
-                    for rule in rules.iter_mut() {
-                        visitor(rule)?;
-                    }
+                for rule in group.rules.iter_mut() {
+                    visitor(rule)?;
                 }
             }
             _ => {}
@@ -90,7 +92,6 @@ pub(crate) fn visit(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     #[test]
@@ -101,12 +102,10 @@ mod tests {
             ))
             .unwrap();
             let validated = crate::config::create_server_configs(configs).unwrap();
-            let Config::Server(server) = &validated.configs[0] else {
+            let crate::config::ResolvedConfig::Server(server) = &validated.configs[0] else {
                 panic!("expected server")
             };
-            let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                panic!("expected generated default rule")
-            };
+            let rule = server.rules.iter().next().unwrap();
             let predicate = rule
                 .criteria
                 .compiled
@@ -134,10 +133,8 @@ mod tests {
             .configs
             .iter()
             .filter_map(|config| {
-                if let Config::Server(server) = config {
-                    let ConfigSelection::Config(rule) = server.rules.iter().next().unwrap() else {
-                        panic!("unexpanded group")
-                    };
+                if let crate::config::ResolvedConfig::Server(server) = config {
+                    let rule = server.rules.iter().next().unwrap();
                     Some(rule.criteria.compiled.as_ref().unwrap().clone())
                 } else {
                     None

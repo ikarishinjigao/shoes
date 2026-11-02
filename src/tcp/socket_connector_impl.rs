@@ -1,7 +1,7 @@
 //! SocketConnectorImpl - Implementation of SocketConnector trait.
 //!
 //! Handles TCP and QUIC transports with bind_interface support.
-//! Created from the socket-related fields of any ClientConfig.
+//! Created from the socket-related fields of any ResolvedClientConfig.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -12,12 +12,13 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error};
+use quinn::Runtime;
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
 use crate::address::{NetLocation, ResolvedLocation};
 use crate::async_stream::AsyncStream;
-use crate::config::{ClientConfig, ClientQuicConfig, Transport};
+use crate::config::{ClientQuicConfig, ResolvedClientConfig, Transport, quic_client::Obfuscation};
 use crate::quic_endpoint::QuicEndpoint;
 use crate::quic_stream::QuicStream;
 use crate::resolver::{Resolver, resolve_addresses, resolve_location};
@@ -30,6 +31,7 @@ use super::socket_connector::SocketConnector;
 const MAX_QUIC_ENDPOINTS: usize = 32;
 const TCP_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const TCP_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const NATIVE_QUIC_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_TCP_ATTEMPTS: usize = 2;
 
 fn interleave_tcp_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
@@ -54,6 +56,17 @@ fn interleave_tcp_addresses(addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
 
 pub(crate) async fn connect_tcp_candidates<T, F>(
     addresses: Vec<SocketAddr>,
+    connect: impl FnMut(SocketAddr) -> std::io::Result<F>,
+) -> std::io::Result<T>
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    connect_tcp_candidates_bounded(addresses, None, connect).await
+}
+
+pub(crate) async fn connect_tcp_candidates_bounded<T, F>(
+    addresses: Vec<SocketAddr>,
+    extra_attempts: Option<&tokio::sync::Semaphore>,
     mut connect: impl FnMut(SocketAddr) -> std::io::Result<F>,
 ) -> std::io::Result<T>
 where
@@ -64,17 +77,24 @@ where
     }
 
     let mut candidates = interleave_tcp_addresses(addresses).into_iter().enumerate();
+    let mut fork_permit = None;
     let mut attempts = FuturesUnordered::new();
     let mut next_launch = tokio::time::Instant::now();
     let mut last_error: Option<(usize, std::io::Error)> = None;
 
     while candidates.len() != 0 || !attempts.is_empty() {
+        let has_active = !attempts.is_empty();
         tokio::select! {
             biased;
-            Some((index, address, result)) = attempts.next(), if !attempts.is_empty() => {
+            Some((index, address, result)) = attempts.next(), if has_active => {
                 match result {
-                    Ok(stream) => return Ok(stream),
+                    Ok(stream) => {
+                        drop(attempts);
+                        return Ok(stream);
+                    }
                     Err(error) => {
+                        // Either completed branch ends the two-attempt fork, freeing its permit.
+                        fork_permit.take();
                         debug!("TCP connect to {address} failed: {error}");
                         if last_error.as_ref().is_none_or(|(previous, _)| index > *previous) {
                             last_error = Some((index, error));
@@ -83,9 +103,18 @@ where
                     }
                 }
             }
-            _ = tokio::time::sleep_until(next_launch),
+            permit = async {
+                tokio::time::sleep_until(next_launch).await;
+                if has_active
+                    && let Some(budget) = extra_attempts
+                {
+                    return budget.acquire().await.map(Some).map_err(std::io::Error::other);
+                }
+                Ok(None)
+            },
                 if candidates.len() != 0 && attempts.len() < MAX_TCP_ATTEMPTS =>
             {
+                fork_permit = permit?;
                 let (index, address) = candidates.next().unwrap();
                 // Socket creation, binding and protection still fail closed.
                 let attempt = connect(address)?;
@@ -115,12 +144,58 @@ enum TransportConfig {
         sni_hostname: Option<String>,
         endpoints: Vec<Arc<QuicEndpoint>>,
         next_endpoint_index: AtomicU8,
+        hopping: Option<Box<HoppingEndpoint>>,
+        native: bool,
     },
+}
+
+#[derive(Debug)]
+struct HoppingEndpoint {
+    settings: crate::config::quic_client::HoppingConfig,
+    obfs: Option<Obfuscation>,
+    config: quinn::ClientConfig,
+    memory_bytes: usize,
+    socket_buffer: usize,
+}
+
+impl HoppingEndpoint {
+    fn open(
+        &self,
+        address: SocketAddr,
+        bind_interface: Option<String>,
+    ) -> std::io::Result<Arc<QuicEndpoint>> {
+        let obfs = self.obfs.clone();
+        let socket_buffer = self.socket_buffer;
+        let factory = Arc::new(move || {
+            let socket = new_udp_socket(address.is_ipv6(), bind_interface.clone())?.into_std()?;
+            wrap_quic_socket(socket, socket_buffer, obfs.as_ref())
+        });
+        let socket = crate::quic_client::hop::HoppingSocket::new(factory, address, &self.settings)?;
+        let mut endpoint =
+            QuicEndpoint::with_abstract_socket(None, socket, self.memory_bytes, None)?;
+        endpoint.set_default_client_config(self.config.clone());
+        Ok(Arc::new(endpoint))
+    }
+}
+
+fn wrap_quic_socket(
+    socket: std::net::UdpSocket,
+    buffer_size: usize,
+    obfs: Option<&Obfuscation>,
+) -> std::io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+    crate::socket_util::set_udp_socket_buffers(socket2::SockRef::from(&socket), buffer_size);
+    let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+    Ok(match obfs {
+        Some(obfs) => {
+            crate::quic_client::salamander::Salamander::wrap(socket, obfs.password().clone())
+        }
+        None => socket,
+    })
 }
 
 /// Implementation of SocketConnector for TCP and QUIC transports.
 ///
-/// Created from the socket-related fields of any ClientConfig:
+/// Created from the socket-related fields of any ResolvedClientConfig:
 /// - `bind_interface`
 /// - `transport`
 /// - `tcp_settings`
@@ -132,7 +207,7 @@ pub struct SocketConnectorImpl {
 }
 
 impl SocketConnectorImpl {
-    /// Create a SocketConnector from a ClientConfig's socket-related fields.
+    /// Create a SocketConnector from a ResolvedClientConfig's socket-related fields.
     ///
     /// # Arguments
     /// * `config` - The client config (socket fields are extracted)
@@ -143,14 +218,14 @@ impl SocketConnectorImpl {
     /// Returns any socket or QUIC endpoint initialization error.
     #[cfg(test)]
     pub fn from_config(
-        config: &ClientConfig,
+        config: &ResolvedClientConfig,
         target_address: Option<&NetLocation>,
     ) -> std::io::Result<Self> {
         Self::from_config_with_limits(config, target_address, crate::resources::limits())
     }
 
     pub fn from_config_with_limits(
-        config: &ClientConfig,
+        config: &ResolvedClientConfig,
         target_address: Option<&NetLocation>,
         limits: crate::config::GlobalLimits,
     ) -> std::io::Result<Self> {
@@ -222,7 +297,18 @@ impl SocketConnectorImpl {
                 });
 
                 let is_xhttp = crate::xhttp::connector::contains(&config.protocol);
-                let alpn_protocols = if is_xhttp && alpn_protocols.is_unspecified() {
+                let is_native = config.protocol.is_native_quic();
+                let (obfs, hopping) = match &config.protocol {
+                    crate::config::ResolvedClientProxyConfig::Hysteria2(settings) => {
+                        (settings.obfs.clone(), settings.hopping.clone())
+                    }
+                    _ => (None, None),
+                };
+                let is_tuic = matches!(
+                    config.protocol,
+                    crate::config::ResolvedClientProxyConfig::Tuic(_)
+                );
+                let alpn_protocols = if (is_xhttp || is_native) && alpn_protocols.is_unspecified() {
                     vec!["h3".to_owned()]
                 } else {
                     alpn_protocols.into_vec()
@@ -251,9 +337,16 @@ impl SocketConnectorImpl {
                     &mut transport_config,
                     limits,
                 );
+                let max_uni_streams = if is_tuic {
+                    limits.max_streams_per_connection.unwrap_or(1024).min(1024) as u32
+                } else if is_xhttp || is_native {
+                    16
+                } else {
+                    0
+                };
                 transport_config
                     .max_concurrent_bidi_streams(0_u32.into())
-                    .max_concurrent_uni_streams(if is_xhttp { 16_u32 } else { 0 }.into())
+                    .max_concurrent_uni_streams(max_uni_streams.into())
                     .keep_alive_interval(Some(std::time::Duration::from_secs(15)))
                     .max_idle_timeout(Some(std::time::Duration::from_secs(30).try_into().unwrap()));
                 if is_xhttp {
@@ -261,10 +354,21 @@ impl SocketConnectorImpl {
                         .datagram_receive_buffer_size(None)
                         .datagram_send_buffer_size(0);
                 }
+                if obfs.is_some() {
+                    let mut mtu = quinn::MtuDiscoveryConfig::default();
+                    mtu.upper_bound(1452 - crate::quic_client::salamander::OVERHEAD);
+                    transport_config.mtu_discovery_config(Some(mtu));
+                }
 
                 quinn_client_config.transport_config(Arc::new(transport_config));
 
-                let endpoints_len = std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS);
+                let endpoints_len = if hopping.is_some() {
+                    0
+                } else if is_native {
+                    1
+                } else {
+                    std::cmp::min(get_num_threads(), MAX_QUIC_ENDPOINTS)
+                };
                 let mut endpoints = Vec::with_capacity(endpoints_len);
 
                 for _ in 0..endpoints_len {
@@ -273,9 +377,13 @@ impl SocketConnectorImpl {
                     } else {
                         new_udp_socket(target_address.address().is_ipv6(), bind_interface.clone())?
                     };
-                    let udp_socket = udp_socket.into_std()?;
-
-                    let mut endpoint = QuicEndpoint::new(None, udp_socket, memory_bytes)?;
+                    let socket = wrap_quic_socket(
+                        udp_socket.into_std()?,
+                        limits.quic_socket_buffer,
+                        obfs.as_ref(),
+                    )?;
+                    let mut endpoint =
+                        QuicEndpoint::with_abstract_socket(None, socket, memory_bytes, None)?;
                     endpoint.set_default_client_config(quinn_client_config.clone());
                     endpoints.push(Arc::new(endpoint));
                 }
@@ -284,6 +392,16 @@ impl SocketConnectorImpl {
                     sni_hostname,
                     endpoints,
                     next_endpoint_index: AtomicU8::new(0),
+                    hopping: hopping.map(|settings| {
+                        Box::new(HoppingEndpoint {
+                            settings,
+                            obfs,
+                            config: quinn_client_config,
+                            memory_bytes,
+                            socket_buffer: limits.quic_socket_buffer,
+                        })
+                    }),
+                    native: is_native,
                 }
             }
         };
@@ -314,6 +432,8 @@ impl SocketConnectorImpl {
             endpoints,
             next_endpoint_index,
             sni_hostname,
+            hopping,
+            native,
         } = &self.transport
         else {
             return Err(std::io::Error::new(
@@ -328,15 +448,31 @@ impl SocketConnectorImpl {
         if address.address().hostname().is_some() {
             addresses.sort_by_key(SocketAddr::is_ipv6);
         }
-        let domain = sni_hostname
-            .as_deref()
-            .unwrap_or_else(|| address.address().hostname().unwrap_or("example.com"));
+        let verification_name = address.address().to_string();
+        let domain = sni_hostname.as_deref().unwrap_or(&verification_name);
         let mut last_error = std::io::Error::other("no resolved addresses succeeded");
         for address in addresses {
-            let index =
-                next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
-            let endpoint = endpoints[index].clone();
+            let endpoint = if let Some(hopping) = hopping {
+                match hopping.open(address, self.bind_interface.clone()) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        debug!("QUIC socket creation for {address} failed: {error}");
+                        last_error = error;
+                        continue;
+                    }
+                }
+            } else {
+                let index =
+                    next_endpoint_index.fetch_add(1, Ordering::Relaxed) as usize % endpoints.len();
+                endpoints[index].clone()
+            };
             let result = match endpoint.connect(address, domain) {
+                Ok(connecting) if *native => {
+                    tokio::time::timeout(NATIVE_QUIC_ATTEMPT_TIMEOUT, connecting)
+                        .await
+                        .map_err(std::io::Error::from)
+                        .and_then(|result| result.map_err(std::io::Error::other))
+                }
                 Ok(connecting) => connecting.await.map_err(std::io::Error::other),
                 Err(error) => Err(std::io::Error::other(error)),
             };
@@ -532,6 +668,7 @@ impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::option_util::NoneOrOne;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tokio::time::Instant;
@@ -603,6 +740,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_hostname_verification_survives_explicit_null_sni() {
+        check_quic_verification(
+            "localhost",
+            "localhost",
+            NoneOrOne::None,
+            false,
+            true,
+            &[
+                "{type: socks}",
+                "{type: xhttp, http_version: h3, protocol: {type: socks}}",
+            ],
+        )
+        .await;
+    }
+
+    const QUIC_PROTOCOLS: &[&str] = &[
+        "{type: socks}",
+        "{type: xhttp, http_version: h3, protocol: {type: socks}}",
+        "{type: hysteria2, password: password}",
+        "{type: tuic, uuid: 01234567-89ab-4def-8123-456789abcdef, password: password}",
+    ];
+
+    #[tokio::test]
+    async fn quic_verifies_ip_certificates_without_sni() {
+        for (host, ipv6) in [("127.0.0.1", false), ("::1", true)] {
+            for sni in [NoneOrOne::Unspecified, NoneOrOne::None] {
+                check_quic_verification(host, host, sni, ipv6, true, QUIC_PROTOCOLS).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn quic_verifies_hostnames_and_sni_overrides() {
+        use NoneOrOne::{One, Unspecified};
+
+        for (host, certificate_name, sni, ipv6, succeeds) in [
+            ("localhost", "localhost", Unspecified, false, true),
+            ("localhost", "localhost", NoneOrOne::None, true, true),
+            ("127.0.0.1", "localhost", One("localhost"), false, true),
+            ("::1", "localhost", One("localhost"), true, true),
+            ("127.0.0.1", "localhost", Unspecified, false, false),
+            ("::1", "localhost", NoneOrOne::None, true, false),
+            ("127.0.0.1", "example.com", NoneOrOne::None, false, false),
+            ("::1", "example.com", Unspecified, true, false),
+            ("localhost", "localhost", One("wrong.example"), true, false),
+        ] {
+            check_quic_verification(host, certificate_name, sni, ipv6, succeeds, QUIC_PROTOCOLS)
+                .await;
+        }
+    }
+
+    async fn check_quic_verification(
+        host: &str,
+        certificate_name: &str,
+        sni: NoneOrOne<&str>,
+        ipv6: bool,
+        succeeds: bool,
+        protocols: &[&str],
+    ) {
+        let certificate =
+            rcgen::generate_simple_self_signed(vec![certificate_name.into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.cert.der().clone()).unwrap();
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap(),
+            )),
+            if ipv6 { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap(),
+        )
+        .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let peer_address = format!("{}:{port}", if ipv6 { "[::1]" } else { "127.0.0.1" });
+        let resolver: Arc<dyn Resolver> =
+            Arc::new(FixedResolver(vec![peer_address.parse().unwrap()]));
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let sni_yaml = match sni {
+            NoneOrOne::Unspecified => String::new(),
+            NoneOrOne::None => "sni_hostname: null, ".into(),
+            NoneOrOne::One(name) => format!("sni_hostname: '{name}', "),
+        };
+        for protocol in protocols {
+            let config: ResolvedClientConfig = crate::config::test_support::from_yaml(&format!(
+                "address: '{host}:{port}'\ntransport: quic\nquic_settings: {{verify: true, {sni_yaml}alpn_protocols: [h3]}}\nprotocol: {protocol}\n"
+            ))
+            .unwrap();
+            let expected_sni = match sni {
+                NoneOrOne::Unspecified => config.address.address().hostname(),
+                NoneOrOne::None => None,
+                NoneOrOne::One(name) => Some(name),
+            };
+            let mut connector =
+                SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
+            let TransportConfig::Quic {
+                endpoints,
+                sni_hostname,
+                ..
+            } = &mut connector.transport
+            else {
+                unreachable!()
+            };
+            assert_eq!(sni_hostname.as_deref(), expected_sni);
+            let mut client_tls = try_create_client_config(
+                true,
+                vec![],
+                vec!["h3".into()],
+                sni_hostname.is_some(),
+                None,
+                false,
+                &Default::default(),
+            )
+            .unwrap();
+            // Trusts the local test certificate without bypassing name verification.
+            client_tls
+                .dangerous()
+                .set_certificate_verifier(verifier.clone());
+            let client_config = quinn::ClientConfig::new(Arc::new(
+                quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+            ));
+            for endpoint in endpoints {
+                Arc::get_mut(endpoint)
+                    .unwrap()
+                    .set_default_client_config(client_config.clone());
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let target = ResolvedLocation::new(config.address.clone());
+                let (client, peer) =
+                    tokio::join!(connector.connect_quic(&resolver, &target), async {
+                        server.accept().await.unwrap().await
+                    },);
+                if !succeeds {
+                    let error = match client {
+                        Err(error) => error,
+                        Ok(_) => panic!("certificate name mismatch unexpectedly succeeded"),
+                    };
+                    assert!(error.to_string().contains("not valid for name"), "{error}");
+                    assert!(peer.is_err());
+                    return;
+                }
+                let client = client.unwrap();
+                let peer = peer.unwrap();
+                let handshake = peer
+                    .handshake_data()
+                    .unwrap()
+                    .downcast::<quinn::crypto::rustls::HandshakeData>()
+                    .unwrap();
+                assert_eq!(handshake.server_name.as_deref(), expected_sni);
+                client.connection.close(0u32.into(), b"done");
+            })
+            .await
+            .unwrap();
+        }
+        server.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
     async fn hostname_quic_prefers_ipv4_without_waiting_for_stalled_ipv6() {
         use tokio::io::AsyncWriteExt;
         let Ok(blackhole) = UdpSocket::bind("[::1]:0").await else {
@@ -626,7 +941,7 @@ mod tests {
                 vec![server_addr]
             };
             let resolver: Arc<dyn Resolver> = Arc::new(FixedResolver(addresses));
-            let config: ClientConfig = serde_yaml::from_str("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
+            let config: ResolvedClientConfig = crate::config::test_support::from_yaml("address: 'localhost:443'\ntransport: quic\nquic_settings: {verify: false}\nprotocol: {type: socks}\n").unwrap();
             let connector =
                 SocketConnectorImpl::from_config(&config, Some(&config.address)).unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
@@ -792,6 +1107,82 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn bounded_fallback_recycles_the_fork_when_the_primary_fails() {
+        let budget = tokio::sync::Semaphore::new(1);
+        let attempts = Arc::new(Attempts::default());
+        let start = Instant::now();
+        let winner = connect_tcp_candidates_bounded(addresses(3), Some(&budget), |address| {
+            let guard = attempts.start(address);
+            Ok(async move {
+                let _guard = guard;
+                match address.port() {
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Err(std::io::ErrorKind::ConnectionRefused.into())
+                    }
+                    2 => std::future::pending().await,
+                    _ => Ok(address),
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner.port(), 3);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert_eq!(attempts.peak.load(Ordering::Relaxed), 2);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_fallback_keeps_primary_progress_while_waiting_for_capacity() {
+        let budget = tokio::sync::Semaphore::new(1);
+        let held = budget.acquire().await.unwrap();
+        let attempts = Arc::new(Attempts::default());
+        let start = Instant::now();
+        let winner = connect_tcp_candidates_bounded(addresses(2), Some(&budget), |address| {
+            let guard = attempts.start(address);
+            Ok(async move {
+                let _guard = guard;
+                if address.port() == 1 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Err(std::io::ErrorKind::ConnectionRefused.into());
+                }
+                Ok(address)
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner.port(), 2);
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert_eq!(attempts.peak.load(Ordering::Relaxed), 1);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.available_permits(), 0);
+        drop(held);
+
+        let mut connect = Box::pin(connect_tcp_candidates_bounded(
+            addresses(2),
+            Some(&budget),
+            |address| {
+                let guard = attempts.start(address);
+                Ok(async move {
+                    let _guard = guard;
+                    std::future::pending::<std::io::Result<()>>().await
+                })
+            },
+        ));
+        let held = budget.acquire().await.unwrap();
+        assert!(futures::poll!(&mut connect).is_pending());
+        tokio::time::advance(TCP_FALLBACK_DELAY).await;
+        assert!(futures::poll!(&mut connect).is_pending());
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 1);
+        drop(connect);
+        assert_eq!(attempts.active.load(Ordering::Relaxed), 0);
+        drop(held);
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn socket_creation_failure_does_not_bypass_protection_or_binding() {
         let attempts = Arc::new(Attempts::default());
         let error = connect_tcp_candidates(addresses(3), |address| {
@@ -855,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_from_config_direct_protocol() {
-        let config = ClientConfig::default(); // default is direct protocol
+        let config = ResolvedClientConfig::default(); // default is direct protocol
         let connector = SocketConnectorImpl::from_config(&config, None);
         assert!(connector.is_ok());
         assert!(matches!(

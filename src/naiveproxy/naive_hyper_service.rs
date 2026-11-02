@@ -736,7 +736,7 @@ mod sniff_tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
             let context = Arc::new(
-                crate::dns::fake_ip::FakeDnsContext::new(Default::default(), resolver.clone())
+                crate::dns::DnsContext::new(Default::default(), resolver.clone())
                     .unwrap(),
             );
             let known = context.allocate("known.example", false).unwrap();
@@ -932,6 +932,8 @@ async fn handle_naive_stream<S: AsyncStream + 'static>(
         crate::util::timeout_stream_setup(prepared.route(&mut stream, &proxy_selector, &resolver))
             .await?;
     let routed = crate::util::timeout_stream_setup(route.connect(&resolver)).await?;
+    drop(proxy_selector);
+    drop(resolver);
     let mut client_stream: Box<dyn AsyncStream> = match routed.setup {
         Some(result) => {
             let flow = result.client_stream.flow().cloned();

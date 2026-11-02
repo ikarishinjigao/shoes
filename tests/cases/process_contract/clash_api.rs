@@ -1,4 +1,4 @@
-use super::{Process, available_address};
+use super::{Process, available_address, reserve_address};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -256,6 +256,7 @@ struct Fixture {
     config: Value,
     api: SocketAddr,
     entry: SocketAddr,
+    reservations: Option<[std::net::TcpListener; 2]>,
     _egress: Vec<AbortOnDropHandle<()>>,
 }
 
@@ -284,15 +285,15 @@ impl Fixture {
         let directory = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let api = available_address();
-        let entry = available_address();
+        let (api_listener, api) = reserve_address();
+        let (entry_listener, entry) = reserve_address();
         let config = json!([
             {"clash_api_address":format!("0.0.0.0:{}", api.port()), "secret":SECRET, "cors_origins":["https://dashboard.example"]},
             {"clash_api_path":directory.path().join("api.sock"), "secret":SECRET},
             {"cache_file_path":directory.path().join("cache.db")},
-            {"client_group":"outbound", "strategy":"selector", "default":"east", "client_proxies":[
-                {"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}},
-                {"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}
+            {"client_group":"outbound", "type":"selector", "default":"east", "client_chains":[
+                {"chain": [{"name":"east", "address":east.to_string(), "protocol":{"type":"socks"}}]},
+                {"chain": [{"name":"west", "address":west.to_string(), "protocol":{"type":"socks"}}]}
             ]},
             {"name":"local-socks", "address":format!("0.0.0.0:{}", entry.port()), "protocol":{"type":"socks"}, "rules":[{"mask":"0.0.0.0/0", "action":"allow", "client_chain":"outbound"}]}
         ]);
@@ -301,6 +302,7 @@ impl Fixture {
             config,
             api,
             entry,
+            reservations: Some([api_listener, entry_listener]),
             _egress: vec![east_task, west_task],
         }
     }
@@ -311,8 +313,9 @@ impl Fixture {
         )
         .unwrap();
     }
-    async fn start(&self) -> Process {
+    async fn start(&mut self) -> Process {
         self.write();
+        drop(self.reservations.take());
         let mut process =
             Process::start(&self.directory.path().join("config.yaml"), &["--no-reload"]);
         process.wait_for("Servers ready").await;
@@ -336,6 +339,120 @@ impl Fixture {
             204
         );
     }
+}
+
+#[tokio::test]
+async fn fixture_reserves_distinct_listener_ports_until_startup() {
+    let mut fixture = Fixture::new().await;
+    assert_ne!(fixture.api.port(), fixture.entry.port());
+    for address in [fixture.api, fixture.entry] {
+        assert_eq!(
+            std::net::TcpListener::bind(("0.0.0.0", address.port()))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+    }
+    for _ in 0..2 {
+        let mut process = fixture.start().await;
+        assert!(fixture.reservations.is_none());
+        assert_eq!(
+            api(fixture.api, "GET", "/version", Value::Null).await.0,
+            200
+        );
+        drop(flow(fixture.entry, b'E').await);
+        fixture.stop(&mut process).await;
+    }
+}
+
+#[tokio::test]
+async fn url_test_routes_without_controller_and_can_be_removed_on_reload() {
+    let mut fixture = Fixture::new().await;
+    fixture
+        .config
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry.get("client_group").is_some() || entry.get("rules").is_some());
+    let group = fixture.outbound_mut();
+    group.as_object_mut().unwrap().remove("default");
+    group["type"] = json!("url-test");
+    group["url"] = json!("http://probe.invalid/");
+    group["interval"] = json!(1);
+    group["timeout"] = json!(500);
+    group["client_chains"][0]["chain"][0]["address"] = json!(available_address().to_string());
+    let mut process = fixture.start().await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let result = shoes_test_support::wireguard::connect(
+                fixture.entry.port(),
+                "192.0.2.100:80".parse().unwrap(),
+            )
+            .await;
+            if let Ok(mut stream) = result {
+                check_flow(&mut stream, b'W').await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!fixture.directory.path().join("cache.db").exists());
+    let west = fixture.outbound_mut()["client_chains"][1]["chain"][0].clone();
+    *fixture.outbound_mut() = json!({
+        "client_group":"outbound", "type":"round-robin", "client_chains":[west]
+    });
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    let _flow = flow(fixture.entry, b'W').await;
+    fixture.stop(&mut process).await;
+    std::net::TcpListener::bind(fixture.entry).unwrap();
+}
+
+#[tokio::test]
+async fn failed_activation_restores_control_generation_and_selection() {
+    let mut fixture = Fixture::new().await;
+    let mut process = fixture.start().await;
+    let mut old = flow(fixture.entry, b'E').await;
+    let generation = api(fixture.api, "GET", "/connections", Value::Null).await.1["connections"][0]
+        ["shoesGeneration"]
+        .clone();
+    let live = fixture.config.clone();
+    fixture.outbound_mut()["default"] = json!("west");
+    let partial = available_address();
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"address":partial.to_string(), "protocol":{"type":"socks"}}),
+        json!({"path":fixture.directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}),
+    ]);
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    assert_eq!(fixture.selected().await, "east");
+    check_flow(&mut old, b'E').await;
+    let mut restored = flow(fixture.entry, b'E').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    assert!(
+        snapshot["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|flow| flow["shoesGeneration"] == generation)
+    );
+    drop(std::net::TcpListener::bind(partial).unwrap());
+    fixture.select("west").await;
+    check_flow(&mut restored, b'E').await;
+    flow(fixture.entry, b'W').await;
+
+    fixture.config = live;
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    assert_eq!(fixture.selected().await, "west");
+    flow(fixture.entry, b'W').await;
+    fixture.stop(&mut process).await;
 }
 
 #[tokio::test]
@@ -486,11 +603,340 @@ async fn selectors_change_real_traffic_and_restore_after_restart() {
 }
 
 #[tokio::test]
+async fn chain_choices_route_probe_and_restore_as_whole_paths() {
+    let mut fixture = Fixture::new().await;
+    let (reservation, prefix) = reserve_address();
+    let west = fixture.outbound_mut()["client_chains"][1]["chain"][0].clone();
+    fixture.outbound_mut()["client_chains"][1] = json!({"name":"via-west","chain":["prefix",west]});
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"client_group":"prefix","client_chains":[{"name":"prefix-client","address":prefix.to_string(),"protocol":{"type":"socks"}}]}),
+        json!({"name":"prefix-server","address":format!("0.0.0.0:{}", prefix.port()),"protocol":{"type":"socks"}}),
+    ]);
+    drop(reservation);
+    let mut process = fixture.start().await;
+    let mut old = flow(fixture.entry, b'E').await;
+    let node = api(fixture.api, "GET", "/proxies/via-west", Value::Null)
+        .await
+        .1;
+    assert_eq!(node["type"], "Relay");
+    assert_eq!(node["all"], json!(["prefix", "west"]));
+    assert_eq!(node["udp"], false);
+    let probe = api(
+        fixture.api,
+        "GET",
+        "/proxies/via-west/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=2000",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(probe.0, 200, "{}", probe.1);
+    assert_eq!(fixture.selected().await, "east");
+    fixture.select("via-west").await;
+    let mut chained = flow(fixture.entry, b'W').await;
+    check_flow(&mut old, b'E').await;
+    fixture.select("east").await;
+    check_flow(&mut chained, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let source_port = chained.local_addr().unwrap().port().to_string();
+    let retained = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["metadata"]["sourcePort"] == source_port
+                && entry["metadata"]["destinationIP"] == "192.0.2.100"
+        })
+        .unwrap();
+    assert_eq!(
+        retained["chains"],
+        json!(["west", "outbound", "prefix-client", "prefix", "outbound"])
+    );
+    fixture.select("via-west").await;
+    fixture.stop(&mut process).await;
+
+    let mut process = fixture.start().await;
+    assert_eq!(fixture.selected().await, "via-west");
+    let mut retained = flow(fixture.entry, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let retained_port = retained.local_addr().unwrap().port().to_string();
+    let before = snapshot["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|connection| connection["metadata"]["sourcePort"] == retained_port)
+        .unwrap();
+    let generation = before["shoesGeneration"].as_u64().unwrap();
+    let live = fixture.config.clone();
+    fixture.outbound_mut()["client_chains"][1]["name"] = json!("via-west-candidate");
+    let partial = available_address();
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"address":partial.to_string(), "protocol":{"type":"socks"}}),
+        json!({"path":fixture.directory.path().join("missing/listener.sock"), "protocol":{"type":"socks"}}),
+    ]);
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    assert_eq!(fixture.selected().await, "via-west");
+    check_flow(&mut retained, b'W').await;
+    let mut restored = flow(fixture.entry, b'W').await;
+    let snapshot = api(fixture.api, "GET", "/connections", Value::Null).await.1;
+    let connections = snapshot["connections"].as_array().unwrap();
+    for port in [
+        retained_port,
+        restored.local_addr().unwrap().port().to_string(),
+    ] {
+        let connection = connections
+            .iter()
+            .find(|connection| connection["metadata"]["sourcePort"] == port)
+            .unwrap();
+        assert_eq!(connection["shoesGeneration"].as_u64().unwrap(), generation);
+    }
+    assert!(
+        connections
+            .iter()
+            .any(|connection| connection["id"] == before["id"])
+    );
+    drop(std::net::TcpListener::bind(partial).unwrap());
+    let probe = api(
+        fixture.api,
+        "GET",
+        "/proxies/via-west/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=2000",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(probe.0, 200, "{}", probe.1);
+
+    fixture.config = live;
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    assert_eq!(fixture.selected().await, "via-west");
+    check_flow(&mut retained, b'W').await;
+    check_flow(&mut restored, b'W').await;
+    flow(fixture.entry, b'W').await;
+    fixture
+        .config
+        .as_array_mut()
+        .unwrap()
+        .retain(|entry| entry["name"] != "prefix-server");
+    fixture.write();
+    process.signal(libc::SIGHUP);
+    process.wait_for("Servers ready").await;
+    let mut failed = timeout(
+        Duration::from_secs(3),
+        shoes_test_support::wireguard::connect(
+            fixture.entry.port(),
+            "192.0.2.100:80".parse().unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    if let Ok(stream) = &mut failed {
+        let _ = stream.write_all(b"ping").await;
+        assert!(
+            timeout(Duration::from_secs(3), stream.read_u8())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+    assert_eq!(fixture.selected().await, "via-west");
+    let unavailable_probe = api(
+        fixture.api,
+        "GET",
+        "/proxies/via-west/delay?url=http%3A%2F%2F192.0.2.1%2F&timeout=2000",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(unavailable_probe.0, 503, "{}", unavailable_probe.1);
+    let unavailable_node = api(fixture.api, "GET", "/proxies/via-west", Value::Null)
+        .await
+        .1;
+    assert_eq!(
+        unavailable_node["history"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["delay"],
+        0
+    );
+    fixture.select("east").await;
+    flow(fixture.entry, b'E').await;
+    fixture.stop(&mut process).await;
+}
+
+#[tokio::test]
+async fn rule_level_chains_rotate_udp_payloads_over_only_eligible_paths() {
+    use shoes_test_support::{
+        socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
+    };
+    timeout(Duration::from_secs(30), async {
+        let mut fixture = Fixture::new().await;
+        let direct = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"direct")
+            .await
+            .unwrap();
+        let relay = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"relay")
+            .await
+            .unwrap();
+        let target = SocketAddr::from(([127, 0, 0, 1], direct.local_addr().port()));
+        let trap = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let (prefix_reservation, prefix) = reserve_address();
+        let (last_reservation, last) = reserve_address();
+        let protocol =
+            json!({"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000","udp_enabled":true});
+        let entry = fixture
+            .config
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["name"] == "local-socks")
+            .unwrap();
+        entry["rules"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("client_chain");
+        entry["rules"][0]["client_chains"] = json!([
+            ["direct"],
+            [{"address":format!("127.0.0.1:{}", trap.local_addr().unwrap().port()),"protocol":{"type":"http"}}],
+            [{"address":prefix.to_string(),"protocol":{"type":"socks"}},
+             {"address":last.to_string(),"protocol":protocol}]
+        ]);
+        fixture.config.as_array_mut().unwrap().extend([
+            json!({"address":format!("0.0.0.0:{}",prefix.port()),"protocol":{"type":"socks"}}),
+            json!({"address":format!("0.0.0.0:{}",last.port()),"protocol":protocol,"rules":[
+                {"mask":"0.0.0.0/0","action":"allow","override_address":format!("127.0.0.1:{}",relay.local_addr().port())}
+            ]}),
+        ]);
+        drop((prefix_reservation, last_reservation));
+        let mut process = fixture.start().await;
+        let mut retained = Vec::new();
+        for suffix in [b"direct".as_slice(), b"relay", b"direct", b"relay"] {
+            let association = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
+                .await
+                .unwrap();
+            assert_eq!(
+                association.send_to(target, b"new-").await.unwrap(),
+                [b"new-".as_slice(), suffix].concat()
+            );
+            retained.push((association, suffix));
+        }
+        for (association, suffix) in retained.into_iter().rev() {
+            assert_eq!(
+                association.send_to(target, b"pinned-").await.unwrap(),
+                [b"pinned-".as_slice(), suffix].concat()
+            );
+        }
+        assert!(
+            timeout(Duration::from_millis(20), trap.accept())
+                .await
+                .is_err()
+        );
+        fixture.stop(&mut process).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn variable_length_udp_choices_pin_associations_and_fail_closed() {
+    use shoes_test_support::{
+        socks5::Socks5UdpAssociation, test_servers::start_udp_response_server,
+    };
+    use std::sync::{Arc, Mutex};
+
+    let mut fixture = Fixture::new().await;
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let endpoint = |name: &'static str| {
+        let received = received.clone();
+        start_udp_response_server("0.0.0.0", 0, move |payload, _| {
+            received.lock().unwrap().push((name, payload.to_vec()));
+            [payload, name.as_bytes()].concat()
+        })
+    };
+    let direct = endpoint("direct").await.unwrap();
+    let relay = endpoint("relay").await.unwrap();
+    let target = SocketAddr::from(([127, 0, 0, 1], direct.local_addr().port()));
+    let (prefix_reservation, prefix) = reserve_address();
+    let (last_reservation, last) = reserve_address();
+    let protocol =
+        json!({"type":"vless","user_id":"550e8400-e29b-41d4-a716-446655440000","udp_enabled":true});
+    fixture.outbound_mut()["client_chains"] = json!([
+        {"name":"east","chain":[
+            {"address":prefix.to_string(),"protocol":{"type":"socks"}},
+            {"address":last.to_string(),"protocol":protocol}
+        ]},
+        {"name":"west","protocol":{"type":"direct"}},
+        {"name":"tcp-only","address":"192.0.2.1:80","protocol":{"type":"http"}}
+    ]);
+    fixture.config.as_array_mut().unwrap().extend([
+        json!({"address":format!("0.0.0.0:{}",prefix.port()),"protocol":{"type":"socks"}}),
+        json!({"address":format!("0.0.0.0:{}",last.port()),"protocol":protocol,"rules":[
+            {"mask":"0.0.0.0/0","action":"allow","override_address":format!("127.0.0.1:{}",relay.local_addr().port())}
+        ]}),
+    ]);
+    drop((prefix_reservation, last_reservation));
+    let mut process = fixture.start().await;
+    let chained = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
+        .await
+        .unwrap();
+    assert_eq!(chained.send_to(target, b"one").await.unwrap(), b"onerelay");
+    fixture.select("west").await;
+    let direct = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
+        .await
+        .unwrap();
+    assert_eq!(direct.send_to(target, b"two").await.unwrap(), b"twodirect");
+    assert_eq!(
+        chained.send_to(target, b"three").await.unwrap(),
+        b"threerelay"
+    );
+    fixture.select("tcp-only").await;
+    assert_eq!(
+        api(fixture.api, "GET", "/proxies/outbound", Value::Null)
+            .await
+            .1["udp"],
+        false
+    );
+    let rejected = Socks5UdpAssociation::connect("127.0.0.1", fixture.entry.port())
+        .await
+        .unwrap();
+    assert!(
+        rejected
+            .send_to_with_timeout(
+                shoes_test_support::socks5::SocksDestination::Ip(target),
+                b"fail-closed",
+                Duration::from_millis(300),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        direct.send_to(target, b"four").await.unwrap(),
+        b"fourdirect"
+    );
+    assert_eq!(
+        chained.send_to(target, b"five").await.unwrap(),
+        b"fiverelay"
+    );
+    fixture.stop(&mut process).await;
+    assert_eq!(
+        *received.lock().unwrap(),
+        [
+            ("relay", b"one".to_vec()),
+            ("direct", b"two".to_vec()),
+            ("relay", b"three".to_vec()),
+            ("direct", b"four".to_vec()),
+            ("relay", b"five".to_vec()),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn auth_errors_rules_providers_and_outbound_probes() {
     let mut fixture = Fixture::new().await;
     let mut unused = super::wireguard_support::client(51820);
-    unused["client_proxies"][0]["name"] = json!("inactive-wireguard");
-    unused["client_proxies"][0]["address"] = json!("unresolvable.invalid:51820");
+    unused["client_chains"][0]["name"] = json!("inactive-wireguard");
+    unused["client_chains"][0]["address"] = json!("unresolvable.invalid:51820");
     fixture.config.as_array_mut().unwrap().push(unused);
     let mut process = fixture.start().await;
     assert_eq!(
@@ -650,7 +1096,7 @@ async fn auth_errors_rules_providers_and_outbound_probes() {
 
 #[tokio::test]
 async fn controller_dispatch_preserves_preflight_and_error_ordering() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let origin = "https://dashboard.example";
     for (method, status) in [("PUT", 204), ("TRACE", 403)] {
@@ -859,9 +1305,9 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
         socks5::Socks5UdpAssociation, test_servers::start_udp_echo_server_with_suffix,
     };
     let mut fixture = Fixture::new().await;
-    fixture.outbound_mut()["client_proxies"] = json!([
-        {"name":"east", "protocol":{"type":"direct"}},
-        {"name":"west", "protocol":{"type":"direct"}}
+    fixture.outbound_mut()["client_chains"] = json!([
+        {"chain":[{"name":"east", "protocol":{"type":"direct"}}]},
+        {"chain":[{"name":"west", "protocol":{"type":"direct"}}]}
     ]);
     let mut process = fixture.start().await;
     let a = start_udp_echo_server_with_suffix("0.0.0.0", 0, b"")
@@ -932,7 +1378,7 @@ async fn udp_payload_totals_and_destination_cancellation_are_isolated() {
 
 #[tokio::test]
 async fn stalled_requests_release_shared_connection_budget() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut subscriptions = Vec::new();
     for _ in 0..16 {
@@ -986,7 +1432,7 @@ async fn stalled_requests_release_shared_connection_budget() {
 #[tokio::test]
 async fn websocket_ping_before_first_frame_preserves_snapshot() {
     use hyper_tungstenite::tungstenite::Message;
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut ws = websocket_path(fixture.api, "/connections?interval=60000").await;
     ws.send(Message::Ping(b"before-first-frame".to_vec().into()))
@@ -1017,7 +1463,7 @@ async fn websocket_ping_before_first_frame_preserves_snapshot() {
 
 #[tokio::test]
 async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut live = flow(fixture.entry, b'E').await;
     let mut connections = websocket(fixture.api).await;
@@ -1093,7 +1539,7 @@ async fn shared_rates_live_connection_snapshots_and_ndjson_streams() {
 
 #[tokio::test]
 async fn failed_save_keeps_routing_and_streams_real_logs_in_both_formats() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
     let mut process = fixture.start().await;
     let mut logs = websocket_path(fixture.api, "/logs?level=warning").await;
     let mut structured = websocket_path(fixture.api, "/logs?level=error&format=structured").await;
@@ -1248,9 +1694,9 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
             client = json!({"type":"tls", "sni_hostname":"localhost", "verify":false, "alpn_protocols":[alpn], "protocol":client});
         }
         let directory = tempfile::tempdir().unwrap();
-        let controller = available_address();
-        let remote = available_address();
-        let entry = available_address();
+        let (controller_listener, controller) = reserve_address();
+        let (remote_listener, remote) = reserve_address();
+        let (entry_listener, entry) = reserve_address();
         let server_path = directory.path().join("server.yaml");
         let client_path = directory.path().join("client.yaml");
         let mut server_config = json!([
@@ -1269,8 +1715,11 @@ async fn layered_and_multiplexed_tcp_counts_payload_and_cancels_only_one_stream(
         }
         std::fs::write(&server_path, serde_yaml::to_string(&server_config).unwrap()).unwrap();
         std::fs::write(&client_path, serde_yaml::to_string(&client_config).unwrap()).unwrap();
+        drop(controller_listener);
+        drop(remote_listener);
         let mut server = Process::start(&server_path, &["--no-reload"]);
         server.wait_for("Servers ready").await;
+        drop(entry_listener);
         let mut client = Process::start(&client_path, &["--no-reload"]);
         client.wait_for("Servers ready").await;
         let payload = vec![b'x'; 4096];

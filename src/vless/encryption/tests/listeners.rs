@@ -31,7 +31,7 @@ async fn listen(config: serde_json::Value) -> Tasks {
     let config = compiled_server(config);
     Tasks(
         crate::tcp::tcp_server::start_servers(
-            crate::config::Config::Server(config),
+            crate::config::ResolvedConfig::Server(config),
             Arc::new(NativeResolver::new()),
         )
         .await
@@ -217,6 +217,7 @@ async fn native_tickets_are_shared_across_bind_ips_but_isolated_by_sni_and_webso
                     ))
                 } else {
                     Box::new(WebsocketTcpClientHandler::new(
+                        "localhost:443".into(),
                         Some(format!("/{scope}")),
                         None,
                         Default::default(),

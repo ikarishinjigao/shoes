@@ -522,6 +522,7 @@ fn visit_proxy(protocol: &mut ServerProxyConfig, visitor: &mut Visitor<'_>) -> i
                 visit_proxy(&mut target.protocol, visitor)?;
             }
         }
+        ServerProxyConfig::SudokuMask(target) => visit_proxy(&mut target.protocol, visitor)?,
         ServerProxyConfig::Xhttp(target) => visit_proxy(&mut target.protocol, visitor)?,
         _ => {}
     }
@@ -541,6 +542,80 @@ fn visit(configs: &mut [Config], visitor: &mut Visitor<'_>) -> io::Result<()> {
                 )?;
             }
             visit_proxy(&mut server.protocol, visitor)?;
+        }
+    }
+    Ok(())
+}
+
+fn visit_resolved_proxy(
+    protocol: &mut crate::config::ResolvedServerProxyConfig,
+    visitor: &mut Visitor<'_>,
+) -> io::Result<()> {
+    match protocol {
+        crate::config::ResolvedServerProxyConfig::Tls {
+            tls_targets,
+            default_tls_target,
+            shadowtls_targets,
+            reality_targets,
+            ..
+        } => {
+            for (sni, target) in tls_targets
+                .iter_mut()
+                .map(|(sni, target)| (Some(sni.as_str()), target))
+                .chain(
+                    default_tls_target
+                        .iter_mut()
+                        .map(|target| (None, target.as_mut())),
+                )
+            {
+                visitor(
+                    &mut target.certificate_binding,
+                    target.certificate_source.as_deref(),
+                    &target.cert,
+                    &target.key,
+                    sni,
+                )?;
+                visit_resolved_proxy(&mut target.protocol, visitor)?;
+            }
+            for target in shadowtls_targets.values_mut() {
+                visit_resolved_proxy(&mut target.protocol, visitor)?;
+            }
+            for target in reality_targets.values_mut() {
+                visit_resolved_proxy(&mut target.protocol, visitor)?;
+            }
+        }
+        crate::config::ResolvedServerProxyConfig::Websocket { targets } => {
+            for target in targets.iter_mut() {
+                visit_resolved_proxy(&mut target.protocol, visitor)?;
+            }
+        }
+        crate::config::ResolvedServerProxyConfig::SudokuMask(target) => {
+            visit_resolved_proxy(&mut target.protocol, visitor)?
+        }
+        crate::config::ResolvedServerProxyConfig::Xhttp(target) => {
+            visit_resolved_proxy(&mut target.protocol, visitor)?
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn visit_resolved(
+    configs: &mut [crate::config::ResolvedConfig],
+    visitor: &mut Visitor<'_>,
+) -> io::Result<()> {
+    for config in configs {
+        if let crate::config::ResolvedConfig::Server(server) = config {
+            if let Some(quic) = &mut server.quic_settings {
+                visitor(
+                    &mut quic.certificate_binding,
+                    quic.certificate_source.as_deref(),
+                    &quic.cert,
+                    &quic.key,
+                    None,
+                )?;
+            }
+            visit_resolved_proxy(&mut server.protocol, visitor)?;
         }
     }
     Ok(())

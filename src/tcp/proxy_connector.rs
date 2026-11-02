@@ -6,7 +6,7 @@
 //!
 //! ## Design
 //!
-//! Every `ClientConfig` with a non-direct protocol implicitly defines a `ProxyConnector`
+//! Every `ResolvedClientConfig` with a non-direct protocol implicitly defines a `ProxyConnector`
 //! through its `protocol` and `address` fields.
 //!
 //! When a config is used:
@@ -75,8 +75,8 @@ pub trait ProxyConnector: Send + Sync + Debug {
     /// when this is the first ProxyConnector in the chain.
     fn proxy_location(&self) -> &NetLocation;
 
-    /// Check if this connector supports UDP-over-TCP tunneling.
-    fn supports_udp_over_tcp(&self) -> bool;
+    /// Whether the connector can relay UDP, independently of its carrier transport.
+    fn supports_udp(&self) -> bool;
 
     async fn try_reuse_tcp_stream(
         &self,

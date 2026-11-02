@@ -93,7 +93,11 @@ async fn roundtrips(ipv6: bool, framed: bool) {
         .packet_information(framed);
     let resolver: Arc<dyn Resolver> = Arc::new(crate::resolver::NativeResolver::new());
     let selector = Arc::new(
-        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
+        create_test_selector(
+            vec![crate::config::ResolvedRuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();
@@ -215,7 +219,7 @@ impl Resolver for FakeDnsTestResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
-    use crate::dns::fake_ip::{FakeDnsContext, FakeDnsResolver};
+    use crate::dns::{DnsContext, FakeDnsResolver};
     use hickory_resolver::proto::op::{Message, Query, ResponseCode};
     use hickory_resolver::proto::rr::{Name, RData, RecordType};
     let (wire, tun) = UnixDatagram::pair().unwrap();
@@ -225,10 +229,14 @@ async fn raw_fd_fake_dns_and_restored_application_udp_preserve_sources() {
         .raw_fd(tun.as_raw_fd())
         .close_fd_on_drop(false);
     let real: Arc<dyn Resolver> = Arc::new(FakeDnsTestResolver);
-    let context = Arc::new(FakeDnsContext::new(Default::default(), real.clone()).unwrap());
+    let context = Arc::new(DnsContext::new(Default::default(), real.clone()).unwrap());
     let resolver: Arc<dyn Resolver> = Arc::new(FakeDnsResolver::new(real, context));
     let selector = Arc::new(
-        create_test_selector(vec![crate::config::RuleConfig::default()], resolver.clone()).unwrap(),
+        create_test_selector(
+            vec![crate::config::ResolvedRuleConfig::default()],
+            resolver.clone(),
+        )
+        .unwrap(),
     );
     let (shutdown, shutdown_rx) = oneshot::channel();
     let mut tasks = JoinSet::new();

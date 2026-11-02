@@ -20,6 +20,7 @@ pub type Choices = BTreeMap<String, String>;
 pub struct SelectionView {
     definitions: SelectorDefinitions,
     choices: RwLock<Arc<Choices>>,
+    pub automatic: super::url_test::AutomaticGroups,
 }
 
 impl SelectionView {
@@ -29,6 +30,16 @@ impl SelectionView {
 
     pub fn definitions(&self) -> &SelectorDefinitions {
         &self.definitions
+    }
+
+    fn publish_choices(&self, choices: Arc<Choices>) {
+        let mut previous = self.choices.write();
+        // Preserves the snapshot identity when effective choices have not changed.
+        if **previous == *choices {
+            return;
+        }
+        self.automatic.choices_changed();
+        *previous = choices;
     }
 }
 
@@ -60,6 +71,7 @@ impl SelectionOwner {
         Ok(Arc::new(SelectionView {
             choices: RwLock::new(Arc::new(effective(&definitions, &self.explicit))),
             definitions,
+            automatic: Default::default(),
         }))
     }
 
@@ -85,7 +97,7 @@ impl SelectionOwner {
 
     pub fn reconcile(&self, candidate: &SelectionView) -> io::Result<()> {
         self.check_capacity(&candidate.definitions)?;
-        *candidate.choices.write() = Arc::new(effective(&candidate.definitions, &self.explicit));
+        candidate.publish_choices(Arc::new(effective(&candidate.definitions, &self.explicit)));
         Ok(())
     }
 
@@ -110,7 +122,7 @@ impl SelectionOwner {
             })?;
         }
         self.explicit = explicit;
-        *self.active.choices.write() = choices;
+        self.active.publish_choices(choices);
         Ok(())
     }
 
@@ -238,6 +250,42 @@ mod tests {
         owner.activate(restored.clone()).unwrap();
         assert_eq!(restored.snapshot()["outbound"], "west");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn removed_members_fall_back_without_overwriting_the_saved_choice() {
+        for default in [None, Some("south")] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cache.db");
+            let mut owner = SelectionOwner::new(Some(&path)).unwrap();
+            owner
+                .activate(owner.prepare(definitions("east")).unwrap())
+                .unwrap();
+            owner.select("outbound", "west").unwrap();
+            let saved = std::fs::read(&path).unwrap();
+
+            let mut reduced = definitions("east");
+            let group = reduced.get_mut("outbound").unwrap();
+            group.members = vec!["north".into(), "south".into()];
+            group.default = default.map(str::to_owned);
+            let fallback = owner.prepare(reduced.clone()).unwrap();
+            owner.activate(fallback.clone()).unwrap();
+            assert_eq!(fallback.snapshot()["outbound"], default.unwrap_or("north"));
+            assert_eq!(owner.explicit["outbound"], "west");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+            drop(owner);
+            let mut owner = SelectionOwner::new(Some(&path)).unwrap();
+            owner.activate(owner.prepare(reduced).unwrap()).unwrap();
+            assert_eq!(
+                owner.active.snapshot()["outbound"],
+                default.unwrap_or("north")
+            );
+            let restored = owner.prepare(definitions("east")).unwrap();
+            owner.activate(restored.clone()).unwrap();
+            assert_eq!(restored.snapshot()["outbound"], "west");
+            assert_eq!(std::fs::read(&path).unwrap(), saved);
+        }
     }
 
     #[test]

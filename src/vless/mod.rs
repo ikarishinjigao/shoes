@@ -12,6 +12,7 @@ mod tls_handshake_util;
 mod vision_filter;
 mod vision_pad;
 mod vision_stream;
+pub(crate) use vision_stream::VisionWriteErrorPolicy;
 mod vision_transport;
 mod vision_unpad;
 mod vless_message_stream;

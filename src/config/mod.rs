@@ -14,25 +14,79 @@
 //! - [`singbox::convert_singbox_config`]: Convert sing-box configs to shoes format
 
 pub(crate) mod client_visit;
+mod compiler;
+pub(crate) mod composition;
+#[cfg(test)]
+mod composition_tests;
 mod fake_dns;
+mod lower;
 mod pem;
+mod plan_ops;
+pub mod resolved;
+pub(crate) mod resolved_visit;
 pub(crate) mod rule_visit;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
 mod types;
 mod validate;
 #[cfg(unix)]
 mod wireguard_devices;
 
-pub(crate) use fake_dns::{tun_endpoint_ips, validate_tun_endpoints};
+#[cfg(unix)]
+pub(crate) use fake_dns::source_tun_endpoint_ips;
+pub(crate) use fake_dns::{protects_tun_endpoints, tun_endpoint_ips, validate_tun_endpoints};
 pub use pem::convert_cert_paths;
 pub(crate) use pem::{is_pem_file_path, pem_candidate_dependencies, pem_reload_dependencies};
+pub use resolved::*;
 pub use types::*;
+#[cfg(unix)]
+pub(crate) use validate::validate_rule_bootstrap;
 pub use validate::{ValidatedConfigs, create_server_configs};
-pub(crate) use validate::{validate_client_vision_protocol, validate_server_vision};
+pub(crate) use validate::{
+    validate_resolved_client_vision_protocol, validate_resolved_server_vision,
+};
+
+fn parse_config_yaml(config_str: &str) -> Result<Vec<Config>, serde_yaml::Error> {
+    use serde::de::{Deserializer, Error, SeqAccess, Visitor};
+
+    struct ConfigList;
+
+    impl<'de> Visitor<'de> for ConfigList {
+        type Value = Vec<Config>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of Shoes configuration entries")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut configs = Vec::new();
+            // Keep YAML locations intact; only Config decoding needs an added index.
+            while let Some(value) = seq.next_element::<serde_yaml::Value>()? {
+                let config = serde_yaml::from_value(value).map_err(|error| {
+                    A::Error::custom(format!("config[{}]: {error}", configs.len()))
+                })?;
+                configs.push(config);
+            }
+            Ok(configs)
+        }
+    }
+
+    serde_yaml::Deserializer::from_str(config_str).deserialize_seq(ConfigList)
+}
 
 /// Loads configuration files from the provided paths.
 ///
 /// Reads each file, parses it as YAML, and returns the combined list of configs.
-pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
+pub async fn load_configs(args: &[String]) -> std::io::Result<Vec<Config>> {
+    let mut configs = load_config_files(args).await?;
+    let files: Vec<_> = args.iter().map(std::path::PathBuf::from).collect();
+    crate::rule_set::validate_remote_paths(&mut configs, &files)?;
+    Ok(configs)
+}
+
+pub(crate) async fn load_config_files(args: &[String]) -> std::io::Result<Vec<Config>> {
     let mut all_configs = vec![];
     for config_filename in args {
         let config_bytes = match tokio::fs::read(config_filename).await {
@@ -55,10 +109,9 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
             }
         };
 
-        let parsed =
-            tokio::task::spawn_blocking(move || serde_yaml::from_str::<Vec<Config>>(&config_str))
-                .await
-                .map_err(std::io::Error::other)?;
+        let parsed = tokio::task::spawn_blocking(move || parse_config_yaml(&config_str))
+            .await
+            .map_err(std::io::Error::other)?;
         let mut configs = match parsed {
             Ok(c) => c,
             Err(e) => {
@@ -76,12 +129,25 @@ pub async fn load_configs(args: &Vec<String>) -> std::io::Result<Vec<Config>> {
 }
 
 pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedConfigs> {
+    compile_configs_with_memory(configs, None).await
+}
+
+pub(crate) async fn compile_configs_with_memory(
+    configs: Vec<Config>,
+    memory: Option<crate::rule_set::MemorySources>,
+) -> std::io::Result<ValidatedConfigs> {
+    blocking_compile(move || validate::create_server_configs_with_memory(configs, memory)).await
+}
+
+pub(crate) async fn blocking_compile<T: Send + 'static>(
+    compile: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
     static COMPILER: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
     let permit = COMPILER.acquire().await.map_err(std::io::Error::other)?;
     tokio::task::spawn_blocking(move || {
         // A canceled caller cannot release the permit while its build is still running.
         let _permit = permit;
-        create_server_configs(configs)
+        compile()
     })
     .await
     .map_err(std::io::Error::other)?
@@ -94,7 +160,7 @@ pub async fn compile_configs(configs: Vec<Config>) -> std::io::Result<ValidatedC
     allow(dead_code)
 )]
 pub fn load_config_str(config_str: &str) -> std::io::Result<Vec<Config>> {
-    serde_yaml::from_str::<Vec<Config>>(config_str).map_err(|e| {
+    parse_config_yaml(config_str).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("Could not parse config string as config YAML: {e}"),

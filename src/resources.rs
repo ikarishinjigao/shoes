@@ -183,10 +183,36 @@ pub(crate) fn try_stream() -> Option<BudgetPermit> {
     STREAMS.acquire(1)
 }
 
+#[derive(Debug)]
+struct ResourceExhausted(String);
+
+impl std::fmt::Display for ResourceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResourceExhausted {}
+
+pub(crate) fn is_exhausted(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<ResourceExhausted>() {
+            return true;
+        }
+        // io::Error::source can skip the wrapped error itself.
+        let source = match error.downcast_ref::<std::io::Error>() {
+            Some(error) => error.get_ref().map(|inner| inner as &dyn std::error::Error),
+            None => error.source(),
+        };
+        let Some(source) = source else { return false };
+        error = source;
+    }
+}
+
 pub(crate) fn exhausted() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::ConnectionRefused,
-        "process resource budget exhausted",
+        ResourceExhausted("process resource budget exhausted".into()),
     )
 }
 
@@ -204,10 +230,10 @@ pub(crate) fn quic_memory_exhausted(bytes: usize) -> std::io::Error {
         .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string());
     std::io::Error::new(
         std::io::ErrorKind::ConnectionRefused,
-        format!(
+        ResourceExhausted(format!(
             "QUIC memory budget exhausted: requested {bytes} bytes, active {} bytes, live cap {limit}",
             state.active,
-        ),
+        )),
     )
 }
 
@@ -216,14 +242,22 @@ pub(crate) fn configure_quic(
     bidi_streams: u32,
     uni_streams: u32,
 ) -> usize {
-    let limits = limits();
+    configure_quic_with_limits(config, bidi_streams, uni_streams, limits())
+}
+
+pub(crate) fn configure_quic_with_limits(
+    config: &mut quinn::ServerConfig,
+    bidi_streams: u32,
+    uni_streams: u32,
+    limits: GlobalLimits,
+) -> usize {
     // Pending Initials are buffered before connection memory is reserved.
     config
         .max_incoming(limits.max_connections.unwrap_or(128).min(128))
         .incoming_buffer_size(65536)
         .incoming_buffer_size_total(1 << 20);
     let transport = Arc::get_mut(&mut config.transport).unwrap();
-    let memory_bytes = configure_quic_transport(transport);
+    let memory_bytes = configure_quic_transport_with_limits(transport, limits);
     // Quinn eagerly allocates advertised stream credit. Unlimited admission keeps
     // the protocol's existing flow-control window rather than advertising infinity.
     let (bidi_streams, uni_streams) = match limits.max_streams_per_connection {
@@ -240,6 +274,7 @@ pub(crate) fn configure_quic(
 }
 
 /// Returns the per-connection allowance from the same limits used to configure the windows.
+#[cfg(test)]
 pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
     configure_quic_transport_with_limits(transport, limits())
 }
@@ -330,6 +365,20 @@ impl Drop for ResourceReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_budget_errors_remain_identifiable_through_wrappers() {
+        let error = exhausted();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(error.to_string(), "process resource budget exhausted");
+        assert!(is_exhausted(&error));
+        let error = std::io::Error::other(std::io::Error::other(error));
+        assert!(is_exhausted(&error));
+        assert!(!is_exhausted(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "process resource budget exhausted",
+        )));
+    }
 
     #[test]
     fn unlimited_budget_tracks_usage_without_a_semaphore_ceiling() {

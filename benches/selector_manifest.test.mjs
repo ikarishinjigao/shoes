@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 test('manifest records supplied commands and embeds a portable baseline helper', t => {
-  const scratch = path.join(os.homedir(), 'tmp');
+  const scratch = process.env.TMPDIR || path.join(os.homedir(), 'tmp');
   fs.mkdirSync(scratch, { recursive: true });
   const root = fs.mkdtempSync(path.join(scratch, 'selector-manifest-test-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -32,7 +32,7 @@ test('manifest records supplied commands and embeds a portable baseline helper',
   git(candidate, 'rm', 'src/removed.rs');
   const helper = '// measured helper\n';
   write(candidate, 'benches/selector_measurement.rs', helper);
-  for (const file of ['run_selector.sh', 'compare_selector.mjs', 'selector_manifest.mjs']) {
+  for (const file of ['run_selector.sh', 'compare_selector.mjs', 'advisory_report.mjs', 'selector_manifest.mjs']) {
     write(candidate, `benches/${file}`, '// fixture tool\n');
   }
   git(candidate, 'add', '.');

@@ -30,12 +30,23 @@ mod fake_dns;
 mod rule_sets;
 
 #[cfg(unix)]
+#[path = "cases/process_contract/remote_rules.rs"]
+mod remote_rules;
+
+#[cfg(unix)]
 #[path = "cases/process_contract/clash_api.rs"]
 mod clash_api;
+
+#[path = "cases/process_contract/config_tooling.rs"]
+mod config_tooling;
 
 #[cfg(unix)]
 #[path = "cases/process_contract/certificates.rs"]
 mod certificates;
+
+#[cfg(unix)]
+#[path = "cases/process_contract/file_logging.rs"]
+mod file_logging;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -58,7 +69,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
     let occupied = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
     let server = wireguard_support::server(occupied.local_addr().unwrap().port());
     let mut endpoint = wireguard_support::client(51820);
-    endpoint["client_proxies"][0]["address"] = json!("unresolvable.invalid:51820");
+    endpoint["client_chains"][0]["address"] = json!("unresolvable.invalid:51820");
     for mode in ["check", "--dry-run"] {
         for (protocol, valid) in [
             (json!({"type": "socks"}), false),
@@ -69,7 +80,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
             ),
             (wireguard_support::vless_protocol(), true),
         ] {
-            endpoint["client_proxies"][0]["protocol"]["peer_client_chain"] = json!([{
+            endpoint["client_chains"][0]["protocol"]["peer_client_chain"] = json!([{
                 "address": "unresolvable.invalid:443", "protocol": protocol,
                 "transport": "quic",
             }]);
@@ -78,7 +89,7 @@ fn wireguard_check_validates_outer_udp_without_dns_or_listeners() {
                 target_os = "fuchsia",
                 target_os = "linux"
             )) {
-                endpoint["client_proxies"][0]["protocol"]["peer_client_chain"][0]["bind_interface"] =
+                endpoint["client_chains"][0]["protocol"]["peer_client_chain"][0]["bind_interface"] =
                     json!("shoes-missing-interface");
             }
             let config = json!([server, endpoint]);
@@ -138,7 +149,7 @@ async fn wireguard_conflicting_shared_client_reload_retains_live_flows() {
     roundtrip(&mut tcp).await;
     assert_eq!(udp.send_to(echo.udp(), b"before").await.unwrap(), b"before");
 
-    configs[2]["client_proxies"][0]["protocol"]["pre_shared_key"] =
+    configs[2]["client_chains"][0]["protocol"]["pre_shared_key"] =
         json!(wireguard_support::key(44));
     std::fs::write(&path, serde_yaml::to_string(&configs).unwrap()).unwrap();
     process.signal(libc::SIGHUP);
@@ -170,8 +181,8 @@ async fn wireguard_reload(detour: bool) {
     if detour {
         let (_, outer_port) = ports.get_localhost_listener_port();
         let protocol = wireguard_support::vless_protocol();
-        endpoint["client_proxies"][0]["address"] = json!(format!("192.0.2.200:{port}"));
-        endpoint["client_proxies"][0]["protocol"]["peer_client_chain"] =
+        endpoint["client_chains"][0]["address"] = json!(format!("192.0.2.200:{port}"));
+        endpoint["client_chains"][0]["protocol"]["peer_client_chain"] =
             json!([{"address": format!("127.0.0.1:{outer_port}"), "protocol": protocol}]);
         servers.push(json!({
             "address": format!("0.0.0.0:{outer_port}"), "protocol": protocol,
@@ -196,7 +207,7 @@ async fn wireguard_reload(detour: bool) {
         .unwrap();
     roundtrip(&mut active).await;
     if detour {
-        client_configs[0]["client_proxies"][0]["protocol"]["peer_client_chain"][0]["protocol"]["udp_enabled"] =
+        client_configs[0]["client_chains"][0]["protocol"]["peer_client_chain"][0]["protocol"]["udp_enabled"] =
             json!(false);
     } else {
         client_configs[1]["rules"][0]["client_chain"] = json!("missing");
@@ -310,7 +321,7 @@ async fn wireguard_reload(detour: bool) {
         Ok(Ok(_))
     ));
     let mut rotated: serde_json::Value = serde_yaml::from_str(&client_config).unwrap();
-    rotated[0]["client_proxies"][0]["protocol"]["private_key"] = json!(wireguard_support::key(44));
+    rotated[0]["client_chains"][0]["protocol"]["private_key"] = json!(wireguard_support::key(44));
     std::fs::write(&client_path, serde_yaml::to_string(&rotated).unwrap()).unwrap();
     client.signal(libc::SIGHUP);
     client.wait_for("Servers ready").await;
@@ -341,6 +352,77 @@ async fn wireguard_partial_startup_releases_previously_started_endpoint() {
     let mut child = Process::start(&path, &["--no-reload"]);
     assert_eq!(child.exit().await.code(), Some(1));
     std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+}
+
+#[test]
+fn tendns_generator_uses_only_the_environment_key_and_prints_one_txt_value() {
+    use tendns::{
+        names::canonical_name,
+        protocol::{self, Secret, Value},
+        resolver::{Clock, SystemClock},
+    };
+
+    let key = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+    let args = [
+        "generate-tendns-txt",
+        "--name",
+        "example.com",
+        "--entry",
+        "nas:A:192.0.2.7",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(args)
+        .env("TENDNS_KEY", key)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    let publication = protocol::decrypt(
+        stdout.trim().as_bytes(),
+        &Secret::decode(key).unwrap(),
+        &canonical_name("example.com").unwrap(),
+        SystemClock.now().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(publication.entries.len(), 1);
+    assert_eq!(publication.entries[0].subdomain, "nas");
+    assert_eq!(
+        publication.entries[0].value,
+        Value::A("192.0.2.7".parse().unwrap())
+    );
+    assert!(!stdout.contains(key));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(key));
+    for secret in [None, Some("invalid-key-must-not-appear")] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_shoes"));
+        command.args(args).env_remove("TENDNS_KEY");
+        if let Some(secret) = secret {
+            command.env("TENDNS_KEY", secret);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("TENDNS_KEY"));
+        if let Some(secret) = secret {
+            assert!(!stderr.contains(secret));
+        }
+    }
+    for invalid in [["--key", key], ["--entry", ":A:192.0.2.7"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_shoes"))
+            .args(args)
+            .args(invalid)
+            .env("TENDNS_KEY", key)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{invalid:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(key));
+    }
 }
 
 #[test]
@@ -448,7 +530,7 @@ fn vless_wrong_side_credentials_fail_check_and_startup() {
     use serde_json::json;
     let directory = tempfile::Builder::new()
         .prefix("vless-wrong-side-")
-        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .tempdir()
         .unwrap();
     for server in [false, true] {
         let address = available_address();
@@ -553,8 +635,12 @@ impl Process {
     }
 
     async fn wait_for(&mut self, marker: &str) {
+        self.wait_for_timeout(marker, Duration::from_secs(8)).await;
+    }
+
+    async fn wait_for_timeout(&mut self, marker: &str, duration: Duration) {
         let mut seen = String::new();
-        let result = timeout(Duration::from_secs(8), async {
+        let result = timeout(duration, async {
             while let Some(line) = self.lines.recv().await {
                 seen.push_str(&line);
                 seen.push('\n');
@@ -585,12 +671,54 @@ impl Process {
     fn signal(&self, signal: i32) {
         assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
     }
+
+    fn stop(&mut self, graceful: bool) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            shoes_test_support::process::stop_child(&mut self.child, graceful, "process-contract");
+        }
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop(std::env::var_os("SHOES_TEST_GRACEFUL_STOP").is_some());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn coverage_process_graceful_stop() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(&config, forward(available_address(), available_address())).unwrap();
+    let mut process = Process::start(&config, &["--no-reload"]);
+    process.wait_for("Servers ready").await;
+    let pid = process.child.id();
+    if std::env::var_os("SHOES_TEST_GRACEFUL_STOP").is_some() {
+        drop(process);
+    } else {
+        process.stop(true);
+        assert!(process.child.wait().unwrap().success());
+    }
+    if let Some(pattern) = std::env::var_os("LLVM_PROFILE_FILE") {
+        let parent = Path::new(&pattern).parent().unwrap();
+        let profiles: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(&format!("-{pid}-")) && name.ends_with(".profraw")
+            })
+            .collect();
+        assert!(
+            !profiles.is_empty(),
+            "subprocess {pid} did not flush a profile"
+        );
+        for profile in profiles {
+            assert!(profile.metadata().unwrap().len() > 0);
+        }
     }
 }
 
@@ -599,6 +727,13 @@ fn available_address() -> SocketAddr {
         .unwrap()
         .local_addr()
         .unwrap()
+}
+
+#[cfg(unix)]
+fn reserve_address() -> (std::net::TcpListener, SocketAddr) {
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+    (listener, address)
 }
 
 #[cfg(unix)]
@@ -643,7 +778,7 @@ async fn tun_worker_failure_exits_nonzero_and_releases_other_listeners() {
 
 fn forward(address: SocketAddr, target: SocketAddr) -> String {
     format!(
-        "- global_limits: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
+        "- global_settings: {{reload_grace_secs: 2}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{target}'\n"
     )
 }
 
@@ -892,7 +1027,7 @@ async fn handshake_chains_expand_groups_and_load_certificates() {
     for chain in [json!("fallback"), client.clone()] {
         for protocol in handshake_protocols(chain) {
             let config = json!([
-                {"client_group": "fallback", "client_proxies": [client.clone(), client.clone()]},
+                {"client_group": "fallback", "client_chains": [{"chain": [client.clone()]}, {"chain": [client.clone()]}]},
                 {"address": available_address().to_string(), "protocol": protocol}
             ]);
             std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
@@ -1014,7 +1149,7 @@ async fn unsupported_quic_allowlists_fail_validation_and_start() {
         json!([direct, {"pool": ["guarded"]}]),
     ] {
         let config = json!([
-            {"client_group": "guarded", "client_proxies": [guarded_proxy]},
+            {"client_group": "guarded", "client_chains": [guarded_proxy]},
             {"address": "0.0.0.0:0", "protocol": {"type": "http"}, "rules": [{"mask": "0.0.0.0/0", "action": "allow", "client_chain": chain}]}
         ]);
         let config_file = tempfile::NamedTempFile::new().unwrap();
@@ -1031,8 +1166,8 @@ async fn unsupported_quic_allowlists_fail_validation_and_start() {
 async fn initial_partial_bind_failure_exits_and_releases_addresses() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    let first = available_address();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let first = available_address();
     for config in [
         format!(
             "- address: ['{first}', '{}']\n  protocol: {{type: http}}\n",
@@ -1130,7 +1265,7 @@ async fn connection_budget_changes_only_with_accepted_reloads_and_counts_drainin
     let address = available_address();
     let config = |max_connections: usize| {
         format!(
-            "- global_limits: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
+            "- global_settings: {{max_connections: {max_connections}, reload_grace_secs: 60}}\n- address: '{address}'\n  protocol:\n    type: forward\n    target: '{}'\n",
             echo.local_addr()
         )
     };
@@ -1145,6 +1280,23 @@ async fn connection_budget_changes_only_with_accepted_reloads_and_counts_drainin
     std::fs::write(&path, config(2).replace("type: forward", "type: unknown")).unwrap();
     child.signal(libc::SIGHUP);
     child.wait_for("Reload rejected").await;
+    assert_rejected(address).await;
+    roundtrip(&mut draining).await;
+
+    // Activation applies the candidate cap, then fails after starting its TCP listener.
+    std::fs::write(
+        &path,
+        format!(
+            "{}- path: '{}'\n  protocol: {{type: http}}\n",
+            config(2),
+            directory.path().join("missing/listener.sock").display(),
+        ),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
     assert_rejected(address).await;
     roundtrip(&mut draining).await;
 
@@ -1470,24 +1622,212 @@ async fn shutdown_interrupts_dns_preparation_without_retiring_listeners() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn replacement_bind_failure_is_fatal_and_cleans_partial_generation() {
+async fn replacement_bind_failure_retains_service_and_allows_subsequent_reload() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.yaml");
-    let address = available_address();
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let config = format!("- address: '{address}'\n  protocol: {{type: http}}\n");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let (address_reservation, address) = reserve_address();
+    let (candidate_reservation, candidate_address) = reserve_address();
+    let config = forward(address, echo.local_addr());
     std::fs::write(&path, &config).unwrap();
+    drop(address_reservation);
     let mut child = Process::start(&path, &["--no-reload"]);
     child.wait_for("Servers ready").await;
+    let mut retained = TcpStream::connect(address).await.unwrap();
+    roundtrip(&mut retained).await;
     std::fs::write(
         &path,
         format!(
-            "{config}- address: '{}'\n  protocol: {{type: http}}\n",
+            "{config}- address: '{candidate_address}'\n  protocol: {{type: http}}\n- address: '{}'\n  protocol: {{type: http}}\n",
             occupied.local_addr().unwrap()
         ),
     )
     .unwrap();
+    drop(candidate_reservation);
     child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; current servers retained")
+        .await;
+    roundtrip(&mut retained).await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    drop(std::net::TcpListener::bind(candidate_address).unwrap());
+    std::fs::write(
+        &path,
+        format!("{config}- address: '{candidate_address}'\n  protocol: {{type: http}}\n"),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    roundtrip(&mut retained).await;
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    TcpStream::connect(candidate_address).await.unwrap();
+    child.signal(libc::SIGTERM);
+    assert_eq!(child.exit().await.code(), Some(0));
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_reuseaddr(true).unwrap();
+    socket.bind(address).unwrap();
+    socket.listen(128).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_quic_activation_rolls_back_or_shuts_down_without_leaking_listeners() {
+    for cancel in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+            .await
+            .unwrap();
+        let address = available_address();
+        let live = forward(address, echo.local_addr())
+            .replace("reload_grace_secs: 2", "reload_grace_secs: 60");
+        std::fs::write(&path, &live).unwrap();
+        let mut child = Process::start(&path, &["--no-reload"]);
+        child.wait_for("Servers ready").await;
+        let mut retained = TcpStream::connect(address).await.unwrap();
+        roundtrip(&mut retained).await;
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let partial = reservation.local_addr().unwrap();
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let blocked = occupied.local_addr().unwrap();
+        drop(reservation);
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let quic = |address: SocketAddr| {
+            serde_json::json!({
+                "address": address.to_string(), "transport":"quic",
+                "quic_settings":{"cert":certificate.cert.pem(), "key":certificate.signing_key.serialize_pem(), "num_endpoints":1},
+                "protocol":{"type":"forward", "target":echo.local_addr().to_string()}
+            })
+        };
+        let mut candidate: serde_json::Value = serde_yaml::from_str(&live).unwrap();
+        candidate
+            .as_array_mut()
+            .unwrap()
+            .extend([quic(partial), quic(blocked)]);
+        std::fs::write(&path, candidate.to_string()).unwrap();
+        child.signal(libc::SIGHUP);
+        if cancel {
+            child.wait_for(&format!("QUIC server at {blocked}")).await;
+        } else {
+            child
+                .wait_for("Reload rejected; previous servers restored")
+                .await;
+            roundtrip(&mut retained).await;
+            roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+            drop(std::net::UdpSocket::bind(partial).unwrap());
+            candidate.as_array_mut().unwrap().pop();
+            std::fs::write(&path, candidate.to_string()).unwrap();
+            child.signal(libc::SIGHUP);
+            child.wait_for("Servers ready").await;
+        }
+        child.signal(libc::SIGTERM);
+        assert!(child.exit().await.success());
+        drop(std::net::UdpSocket::bind(partial).unwrap());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(address).unwrap();
+        socket.listen(128).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn descriptor_tun_can_restart_after_failed_activation_and_releases_on_exit() {
+    check_descriptor_tun_reload(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn candidate_only_tun_descriptor_survives_rejected_reload() {
+    check_descriptor_tun_reload(false).await;
+}
+
+#[cfg(unix)]
+async fn check_descriptor_tun_reload(initially_enabled: bool) {
+    use std::os::fd::OwnedFd;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.yaml");
+    let echo = shoes_test_support::test_servers::start_tcp_stream_echo_server("127.0.0.1", 0)
+        .await
+        .unwrap();
+    let address = available_address();
+    let config = format!(
+        "{}- device_fd: 0\n  rules: allow-all-direct\n",
+        forward(address, echo.local_addr())
+    );
+    let initial = if initially_enabled {
+        config.clone()
+    } else {
+        forward(address, echo.local_addr())
+    };
+    std::fs::write(&path, initial).unwrap();
+    let (mut peer, device) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_shoes"))
+        .args(["-t", "1", "--no-reload"])
+        .arg(&path)
+        .stdin(Stdio::from(OwnedFd::from(device)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Process::from_child(child);
+    child.wait_for("Servers ready").await;
+    // Proxy entries start first; a second TUN forces failure after descriptor adoption.
+    std::fs::write(
+        &path,
+        format!("{config}- device_fd: -1\n  rules: allow-all-direct\n"),
+    )
+    .unwrap();
+    child.signal(libc::SIGHUP);
+    child
+        .wait_for("Reload rejected; previous servers restored")
+        .await;
+    let error = std::io::Read::read(&mut peer, &mut [0])
+        .expect_err("rejected reload closed the inherited TUN descriptor");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    roundtrip(&mut TcpStream::connect(address).await.unwrap()).await;
+    std::fs::write(&path, config).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    std::fs::write(&path, forward(address, echo.local_addr())).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("Servers ready").await;
+    assert_eq!(std::io::Read::read(&mut peer, &mut [0]).unwrap(), 0);
+    child.signal(libc::SIGTERM);
+    assert!(child.exit().await.success());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rollback_failure_is_reported_and_partial_services_are_stopped() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("old");
+    std::fs::create_dir(&parent).unwrap();
+    let socket = parent.join("listener.sock");
+    let path = directory.path().join("config.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "- path: '{}'\n  protocol: {{type: socks}}\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    let mut child = Process::start(&path, &["--no-reload"]);
+    child.wait_for("Servers ready").await;
+    std::fs::remove_file(&socket).unwrap();
+    std::fs::remove_dir(parent).unwrap();
+    let partial = available_address();
+    std::fs::write(&path, format!("- address: '{partial}'\n  protocol: {{type: socks}}\n- path: '{}'\n  protocol: {{type: socks}}\n", directory.path().join("missing/listener.sock").display())).unwrap();
+    child.signal(libc::SIGHUP);
+    child.wait_for("rollback failed").await;
     assert_eq!(child.exit().await.code(), Some(1));
-    std::net::TcpListener::bind(address).unwrap();
+    std::net::TcpListener::bind(partial).unwrap();
 }
