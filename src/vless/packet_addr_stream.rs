@@ -6,7 +6,7 @@
 use std::io::{Error, ErrorKind, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::ReadBuf;
 
@@ -107,25 +107,30 @@ impl<S: AsyncMessageStream> AsyncReadTargetedMessage for VlessPacketAddrStream<S
         output: &mut ReadBuf<'_>,
     ) -> Poll<Result<NetLocation>> {
         let this = self.get_mut();
-        let mut message = ReadBuf::new(&mut this.read_buffer);
-        match Pin::new(&mut this.stream).poll_read_message(cx, &mut message) {
-            Poll::Ready(Ok(())) => {
-                if message.filled().is_empty() {
-                    return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
-                }
+        loop {
+            let mut message = ReadBuf::new(&mut this.read_buffer);
+            ready!(Pin::new(&mut this.stream).poll_read_message(cx, &mut message))?;
 
-                let (destination, payload) = parse_packet_addr_message(message.filled())?;
-                if output.remaining() < payload.len() {
-                    return Poll::Ready(Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        "output buffer is too small for PacketAddr payload",
-                    )));
-                }
-                output.put_slice(payload);
-                Poll::Ready(Ok(destination))
+            // An empty VLESS message is EOF; a PacketAddr message always carries an address.
+            if message.filled().is_empty() {
+                return Poll::Ready(Ok(NetLocation::UNSPECIFIED));
             }
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
+
+            let (destination, payload) = parse_packet_addr_message(message.filled())?;
+            if payload.is_empty() {
+                // The UDP router treats an empty targeted read as EOF, so forwarding a
+                // zero-length datagram would tear down every destination on this stream.
+                log::debug!("Dropping zero-length PacketAddr datagram to {destination}");
+                continue;
+            }
+            if output.remaining() < payload.len() {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "output buffer is too small for PacketAddr payload",
+                )));
+            }
+            output.put_slice(payload);
+            return Poll::Ready(Ok(destination));
         }
     }
 }
@@ -231,6 +236,43 @@ mod tests {
             parse_packet_addr_message(&[3, 0, 0]).unwrap_err().kind(),
             ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn zero_length_datagrams_are_skipped_instead_of_signalling_eof() {
+        let (client, mut peer) = tcp_pair().await.unwrap();
+        let mut stream = VlessPacketAddrStream::new(VlessMessageStream::new(client));
+
+        let destination = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 5353));
+        for payload in [&b""[..], &b"after-empty"[..]] {
+            let mut message = Vec::new();
+            write_packet_addr_header(&mut message, &destination);
+            message.extend_from_slice(payload);
+            peer.write_all(&(message.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            peer.write_all(&message).await.unwrap();
+        }
+        peer.shutdown().await.unwrap();
+
+        let mut output_bytes = [0u8; 64];
+        let mut output = ReadBuf::new(&mut output_bytes);
+        let parsed_destination =
+            poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut output))
+                .await
+                .unwrap();
+        assert_eq!(
+            parsed_destination.to_socket_addr_nonblocking(),
+            Some(destination)
+        );
+        assert_eq!(output.filled(), b"after-empty");
+
+        // Peer EOF is still reported as an empty read.
+        let mut output = ReadBuf::new(&mut output_bytes);
+        poll_fn(|cx| Pin::new(&mut stream).poll_read_targeted_message(cx, &mut output))
+            .await
+            .unwrap();
+        assert!(output.filled().is_empty());
     }
 
     #[tokio::test]
