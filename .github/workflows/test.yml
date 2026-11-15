@@ -164,9 +164,6 @@ jobs:
         .github/require-tests.sh cargo test -p shoes --locked --lib
         reference_peer_tcp_uot_and_concurrent_session_reuse -- --ignored
 
-    - name: Run process contract tests
-      run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
-
     - name: Run rule compilation allocation regression
       run: cargo test -p shoes --locked --test rule_allocation --verbose
 
@@ -180,6 +177,71 @@ jobs:
       run: >-
         .github/require-tests.sh timeout --kill-after=10s 10m cargo test -p shoes --locked
         --test rule_properties -- --test-threads=1
+
+  # The serial suites below dominate the Unit tests wall time (~9 and ~6 minutes),
+  # so they run in parallel jobs that reuse the Unit tests dependency cache.
+  process-contract-tests:
+    name: Process contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    # Restore-only: cache keys and paths must match the Unit tests job exactly.
+    - name: Restore cargo registry
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore cargo index
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore cargo build
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Run process contract tests
+      run: cargo test -p shoes --locked --test process_contract --verbose -- --test-threads=1
+
+  ffi-tests:
+    name: Host FFI tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    # Restore-only: cache keys and paths must match the Unit tests job exactly.
+    - name: Restore cargo registry
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore cargo index
+      uses: actions/cache/restore@v6
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Restore cargo build
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Run host FFI tests
       run: cargo test -p shoes --locked --lib --features ffi -- --test-threads=1
